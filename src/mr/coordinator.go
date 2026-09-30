@@ -19,7 +19,6 @@ type Coordinator struct {
 	NMap                    int
 	hasMapTasksCompleted    bool
 	hasReduceTasksCompleted bool
-	Loop                    bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -35,10 +34,10 @@ func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) er
 	if len(c.MapTasks) != 0 && c.hasMapTasksCompleted == false {
 		for index, mapTask := range c.MapTasks {
 			if mapTask.Status == TaskStatusIdle {
+				c.MapTasks[index].TTL = time.Now().Add(5 * time.Second).UnixMilli()
 				c.MapTasks[index].Status = TaskStatusInProgress
 				task.Task = c.MapTasks[index]
 				task.Status = Task_
-				task.Task.TTL = time.Now().Add(5 * time.Second).UnixMilli()
 				return nil
 			}
 		}
@@ -61,10 +60,10 @@ func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) er
 	if len(c.ReduceTasks) != 0 && c.hasMapTasksCompleted && c.hasReduceTasksCompleted == false {
 		for index, reduceTask := range c.ReduceTasks {
 			if reduceTask.Status == TaskStatusIdle {
+				c.ReduceTasks[index].TTL = time.Now().Add(5 * time.Second).UnixMilli()
 				c.ReduceTasks[index].Status = TaskStatusInProgress
 				task.Task = c.ReduceTasks[index]
 				task.Status = Task_
-				task.Task.TTL = time.Now().Add(5 * time.Second).UnixMilli()
 				return nil
 			}
 		}
@@ -164,7 +163,6 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	c.NMap = len(files)
 	c.MapTasks = mapTasks[:]
 	c.ReduceTasks = reduceTasks[:]
-	c.Loop = true
 
 	c.server(sockname)
 	return &c
