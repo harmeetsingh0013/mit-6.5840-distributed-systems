@@ -22,15 +22,21 @@ type Coordinator struct {
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) AssignTask(request RequestTask, task *Task) error {
+func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.hasMapTasksCompleted && c.hasReduceTasksCompleted {
+		task.Status = Exit
+		return nil
+	}
 
 	if len(c.MapTasks) != 0 && c.hasMapTasksCompleted == false {
 		for index, mapTask := range c.MapTasks {
 			if mapTask.Status == TaskStatusIdle {
 				c.MapTasks[index].Status = TaskStatusInProgress
-				*task = c.MapTasks[index]
+				task.Task = c.MapTasks[index]
+				task.Status = Task_
 				return nil
 			}
 		}
@@ -38,19 +44,28 @@ func (c *Coordinator) AssignTask(request RequestTask, task *Task) error {
 		c.hasMapTasksCompleted = isMapTasksCompleted(c.MapTasks)
 	}
 
+	if c.hasMapTasksCompleted == false {
+		task.Status = Wait
+		return nil
+	}
+
 	if len(c.ReduceTasks) != 0 && c.hasMapTasksCompleted && c.hasReduceTasksCompleted == false {
 		for index, reduceTask := range c.ReduceTasks {
 			if reduceTask.Status == TaskStatusIdle {
 				c.ReduceTasks[index].Status = TaskStatusInProgress
-				*task = c.ReduceTasks[index]
+				task.Task = c.ReduceTasks[index]
+				task.Status = Task_
 				return nil
 			}
 		}
 		c.hasReduceTasksCompleted = isReduceTasksCompleted(c.ReduceTasks)
 	}
-	if c.hasMapTasksCompleted == true && c.hasReduceTasksCompleted == true {
-		task.Loop = false
+
+	if c.hasReduceTasksCompleted == false {
+		task.Status = Wait
+		return nil
 	}
+	task.Status = Exit
 	return nil
 }
 

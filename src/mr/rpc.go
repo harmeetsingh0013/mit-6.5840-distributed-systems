@@ -19,6 +19,14 @@ const (
 	TaskTypeReduce TaskType = "reduce"
 )
 
+type RequestTaskRepyStatus string
+
+const (
+	Wait  RequestTaskRepyStatus = "wait"
+	Exit  RequestTaskRepyStatus = "exit"
+	Task_ RequestTaskRepyStatus = "task"
+)
+
 type Task struct {
 	ID       int
 	FileName string
@@ -27,6 +35,11 @@ type Task struct {
 	NMap     int
 	Type     TaskType
 	Loop     bool
+}
+
+type RequestTaskReply struct {
+	Status RequestTaskRepyStatus
+	Task   Task
 }
 
 type TaskCompletionRequest struct {

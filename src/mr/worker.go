@@ -2,6 +2,7 @@ package mr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
@@ -9,6 +10,7 @@ import (
 	"net/rpc"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -41,51 +43,55 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	coordSockName = sockname
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-
 	for {
 		request := &RequestTask{}
-		task := &Task{}
+		taskReply := &RequestTaskReply{}
 
-		ok := call("Coordinator.AssignTask", &request, &task)
+		ok := call("Coordinator.AssignTask", &request, &taskReply)
 		if !ok {
 			fmt.Printf("Failed to get the Task!\n")
 		}
 
-		if !task.Loop {
-			break
-		}
+		switch taskReply.Status {
+		case Wait:
+			time.Sleep(100 * time.Millisecond)
+			continue
+		case Exit:
+			return
+		case Task_:
+			task := taskReply.Task
+			switch task.Type {
+			case TaskTypeMap:
+				if err := mapData(task, mapf); err == nil {
+					taskCompletionRequest := &TaskCompletionRequest{
+						ID:   task.ID,
+						Type: task.Type,
+					}
+					taskCompletionReply := &TaskCompletionReply{}
 
-		switch task.Type {
-		case TaskTypeMap:
-			if err := mapData(*task, mapf); err == nil {
+					ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
+					if !ok {
+						fmt.Printf("Failed to Report Task Completion!\n")
+					}
+				}
+			case TaskTypeReduce:
+				reduceData(task, reducef)
 				taskCompletionRequest := &TaskCompletionRequest{
 					ID:   task.ID,
 					Type: task.Type,
 				}
 				taskCompletionReply := &TaskCompletionReply{}
-
 				ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
 				if !ok {
 					fmt.Printf("Failed to Report Task Completion!\n")
 				}
-			}
-		case TaskTypeReduce:
-			reduceData(*task, reducef)
-			taskCompletionRequest := &TaskCompletionRequest{
-				ID:   task.ID,
-				Type: task.Type,
-			}
-			taskCompletionReply := &TaskCompletionReply{}
-			ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
-			if !ok {
-				fmt.Printf("Failed to Report Task Completion!\n")
+			default:
+				fmt.Printf("No new task exists: %v\n", task.Type)
 			}
 		default:
-			fmt.Printf("No new task exists: %v\n", task.Type)
+			fmt.Printf("Unknown status received: %v\n", taskReply.Status)
 		}
+
 	}
 
 }
@@ -146,7 +152,11 @@ func reduceData(task Task, reducef func(string, []string) string) error {
 		inputFileName := fmt.Sprintf("mr-%d-%d", i, task.ID)
 		file, err := os.Open(inputFileName)
 		if err != nil {
-			log.Fatalf("cannot open %v", inputFileName)
+			if errors.Is(err, os.ErrNotExist) {
+				continue // empty partition
+			}
+			log.Fatalf("cannot read %v", inputFileName)
+			return err // real I/O error
 		}
 		defer file.Close()
 
