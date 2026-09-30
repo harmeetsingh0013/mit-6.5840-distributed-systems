@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
@@ -37,6 +38,7 @@ func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) er
 				c.MapTasks[index].Status = TaskStatusInProgress
 				task.Task = c.MapTasks[index]
 				task.Status = Task_
+				task.Task.TTL = time.Now().Add(5 * time.Second).UnixMilli()
 				return nil
 			}
 		}
@@ -45,6 +47,13 @@ func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) er
 	}
 
 	if c.hasMapTasksCompleted == false {
+		for index, task := range c.MapTasks {
+			if task.Status == TaskStatusInProgress {
+				if time.Now().UnixMilli() > task.TTL {
+					c.MapTasks[index].Status = TaskStatusIdle
+				}
+			}
+		}
 		task.Status = Wait
 		return nil
 	}
@@ -55,6 +64,7 @@ func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) er
 				c.ReduceTasks[index].Status = TaskStatusInProgress
 				task.Task = c.ReduceTasks[index]
 				task.Status = Task_
+				task.Task.TTL = time.Now().Add(5 * time.Second).UnixMilli()
 				return nil
 			}
 		}
@@ -62,6 +72,13 @@ func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) er
 	}
 
 	if c.hasReduceTasksCompleted == false {
+		for index, task := range c.ReduceTasks {
+			if task.Status == TaskStatusInProgress {
+				if time.Now().UnixMilli() > task.TTL {
+					c.ReduceTasks[index].Status = TaskStatusIdle
+				}
+			}
+		}
 		task.Status = Wait
 		return nil
 	}
@@ -161,7 +178,6 @@ func buildMapTask(filename string, index int, nReduce int, taskType TaskType, nM
 		NReduce:  nReduce,
 		Type:     taskType,
 		NMap:     nMap,
-		Loop:     true,
 	}
 	return task
 }

@@ -34,7 +34,7 @@ type Task struct {
 	NReduce  int
 	NMap     int
 	Type     TaskType
-	Loop     bool
+	TTL      int64
 }
 
 type RequestTaskReply struct {
