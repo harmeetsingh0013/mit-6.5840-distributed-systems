@@ -44,42 +44,47 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	request := &RequestTask{}
-	task := &Task{}
 
-	fmt.Println("AssignTask START")
-	ok := call("Coordinator.AssignTask", &request, &task)
-	if !ok {
-		fmt.Printf("Failed to get the Task!\n")
-	}
+	for {
+		request := &RequestTask{}
+		task := &Task{}
 
-	fmt.Println("AssignTask Get", *task)
-	switch task.Type {
-	case TaskTypeMap:
-		if err := mapData(*task, mapf); err == nil {
+		ok := call("Coordinator.AssignTask", &request, &task)
+		if !ok {
+			fmt.Printf("Failed to get the Task!\n")
+		}
+
+		if !task.Loop {
+			break
+		}
+
+		switch task.Type {
+		case TaskTypeMap:
+			if err := mapData(*task, mapf); err == nil {
+				taskCompletionRequest := &TaskCompletionRequest{
+					ID:   task.ID,
+					Type: task.Type,
+				}
+				taskCompletionReply := &TaskCompletionReply{}
+
+				ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
+				if !ok {
+					fmt.Printf("Failed to Report Task Completion!\n")
+				}
+			}
+		case TaskTypeReduce:
+			reduceData(*task, reducef)
 			taskCompletionRequest := &TaskCompletionRequest{
 				ID:   task.ID,
 				Type: task.Type,
 			}
 			taskCompletionReply := &TaskCompletionReply{}
-
-			fmt.Println("ReportTaskCompletion START → task: ", *task)
 			ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
 			if !ok {
 				fmt.Printf("Failed to Report Task Completion!\n")
 			}
-			fmt.Println("ReportTaskCompletion End → task: ", *task)
-		}
-	case TaskTypeReduce:
-		reduceData(*task, reducef)
-		taskCompletionRequest := &TaskCompletionRequest{
-			ID:   task.ID,
-			Type: task.Type,
-		}
-		taskCompletionReply := &TaskCompletionReply{}
-		ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
-		if !ok {
-			fmt.Printf("Failed to Report Task Completion!\n")
+		default:
+			fmt.Printf("No new task exists: %v\n", task.Type)
 		}
 	}
 
@@ -99,7 +104,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err := c.Call(rpcname, args, reply); err == nil {
 		return true
 	}
-	fmt.Println(err)
 	log.Printf("%d: call failed err %v", os.Getpid(), err)
 	return false
 }
@@ -134,7 +138,7 @@ func mapData(task Task, mapf func(string, string) []KeyValue) error {
 }
 
 func reduceData(task Task, reducef func(string, []string) string) error {
-	values := make([]string, 0)
+	keyValue := make(map[string][]string)
 	oname := "mr-out-" + strconv.Itoa(task.ID)
 	ofile, _ := os.Create(oname)
 
@@ -154,12 +158,14 @@ func reduceData(task Task, reducef func(string, []string) string) error {
 		}
 
 		for _, kv := range kva {
-			values = append(values, kv.Value)
+			keyValue[kv.Key] = append(keyValue[kv.Key], kv.Value)
 		}
 	}
 
-	result := reducef(strconv.Itoa(task.ID), values)
-	fmt.Fprintf(ofile, "%v %v\n", strconv.Itoa(task.ID), result)
+	for key, val := range keyValue {
+		result := reducef(key, val)
+		fmt.Fprintf(ofile, "%v %v\n", key, result)
+	}
 	return nil
 }
 

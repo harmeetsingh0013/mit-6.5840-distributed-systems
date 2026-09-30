@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -11,12 +10,15 @@ import (
 )
 
 type Coordinator struct {
-	mu          sync.Mutex
-	Tasks       []Task
-	MapTasks    []Task
-	ReduceTasks []Task
-	NReduce     int
-	NMap        int
+	mu                      sync.Mutex
+	Tasks                   []Task
+	MapTasks                []Task
+	ReduceTasks             []Task
+	NReduce                 int
+	NMap                    int
+	hasMapTasksCompleted    bool
+	hasReduceTasksCompleted bool
+	Loop                    bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -24,35 +26,37 @@ func (c *Coordinator) AssignTask(request RequestTask, task *Task) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.Tasks) == 0 {
-		log.Fatalf("No tasks available!")
+	if len(c.MapTasks) != 0 && c.hasMapTasksCompleted == false {
+		for index, mapTask := range c.MapTasks {
+			if mapTask.Status == TaskStatusIdle {
+				c.MapTasks[index].Status = TaskStatusInProgress
+				*task = c.MapTasks[index]
+				return nil
+			}
+		}
+
+		c.hasMapTasksCompleted = isMapTasksCompleted(c.MapTasks)
 	}
 
-	*task = c.Tasks[0]
-	task.Status = TaskStatusInProgress
-	c.Tasks = c.Tasks[1:]
-	switch task.Type {
-	case TaskTypeMap:
-		fmt.Println("MapTask START", *task)
-		c.MapTasks = append(c.MapTasks, *task)
-	case TaskTypeReduce:
-		fmt.Println("ReduceTask START", *task)
-		c.ReduceTasks = append(c.ReduceTasks, *task)
+	if len(c.ReduceTasks) != 0 && c.hasMapTasksCompleted && c.hasReduceTasksCompleted == false {
+		for index, reduceTask := range c.ReduceTasks {
+			if reduceTask.Status == TaskStatusIdle {
+				c.ReduceTasks[index].Status = TaskStatusInProgress
+				*task = c.ReduceTasks[index]
+				return nil
+			}
+		}
+		c.hasReduceTasksCompleted = isReduceTasksCompleted(c.ReduceTasks)
 	}
-
+	if c.hasMapTasksCompleted == true && c.hasReduceTasksCompleted == true {
+		task.Loop = false
+	}
 	return nil
 }
 
 func (c *Coordinator) ReportTaskCompletion(request *TaskCompletionRequest, reply *TaskCompletionReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if len(c.Tasks) == 0 && len(c.ReduceTasks) == 0 && len(c.MapTasks) != 0 {
-		for i := 0; i < c.NReduce; i++ {
-			reduceTask := buildMapTask("", i, c.NReduce, TaskTypeReduce, c.NMap)
-			c.Tasks = append(c.Tasks, reduceTask)
-		}
-	}
 
 	switch request.Type {
 	case TaskTypeMap:
@@ -93,14 +97,6 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	fmt.Println("Tasks length: ", len(c.Tasks))
-	fmt.Println("MapTasks length: ", len(c.MapTasks))
-	fmt.Println("ReduceTasks length: ", len(c.ReduceTasks))
-
-	if len(c.Tasks) != 0 {
-		return ret
-	}
-
 	for _, task := range c.MapTasks {
 		if task.Status != TaskStatusCompleted {
 			return ret
@@ -121,15 +117,22 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
-	tasks := make([]Task, len(files))
+	mapTasks := make([]Task, len(files))
+	reduceTasks := make([]Task, nReduce)
 
 	for index, file := range files {
-		tasks[index] = buildMapTask(file, index, nReduce, TaskTypeMap, len(files))
+		mapTasks[index] = buildMapTask(file, index, nReduce, TaskTypeMap, len(files))
+	}
+
+	for i := 0; i < nReduce; i++ {
+		reduceTasks[i] = buildMapTask("", i, nReduce, TaskTypeReduce, len(files))
 	}
 
 	c.NReduce = nReduce
 	c.NMap = len(files)
-	c.Tasks = tasks[:]
+	c.MapTasks = mapTasks[:]
+	c.ReduceTasks = reduceTasks[:]
+	c.Loop = true
 
 	c.server(sockname)
 	return &c
@@ -143,6 +146,25 @@ func buildMapTask(filename string, index int, nReduce int, taskType TaskType, nM
 		NReduce:  nReduce,
 		Type:     taskType,
 		NMap:     nMap,
+		Loop:     true,
 	}
 	return task
+}
+
+func isMapTasksCompleted(mapTasks []Task) bool {
+	for _, task := range mapTasks {
+		if task.Status != TaskStatusCompleted {
+			return false
+		}
+	}
+	return true
+}
+
+func isReduceTasksCompleted(reduceTasks []Task) bool {
+	for _, task := range reduceTasks {
+		if task.Status != TaskStatusCompleted {
+			return false
+		}
+	}
+	return true
 }

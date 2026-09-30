@@ -45,6 +45,7 @@ type Task struct {
 	NReduce  int
 	NMap     int
 	Type     TaskType
+	Loop     bool
 }
 
 type TaskCompletionRequest struct {
