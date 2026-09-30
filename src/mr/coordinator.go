@@ -32,52 +32,28 @@ func (c *Coordinator) AssignTask(request RequestTask, task *RequestTaskReply) er
 	}
 
 	if len(c.MapTasks) != 0 && c.hasMapTasksCompleted == false {
-		for index, mapTask := range c.MapTasks {
-			if mapTask.Status == TaskStatusIdle {
-				c.MapTasks[index].TTL = time.Now().Add(5 * time.Second).UnixMilli()
-				c.MapTasks[index].Status = TaskStatusInProgress
-				task.Task = c.MapTasks[index]
-				task.Status = Task_
-				return nil
-			}
+		if assignIdleTask(c.MapTasks, task) {
+			return nil
 		}
 
-		c.hasMapTasksCompleted = isMapTasksCompleted(c.MapTasks)
+		c.hasMapTasksCompleted = allTasksCompleted(c.MapTasks)
 	}
 
 	if c.hasMapTasksCompleted == false {
-		for index, task := range c.MapTasks {
-			if task.Status == TaskStatusInProgress {
-				if time.Now().UnixMilli() > task.TTL {
-					c.MapTasks[index].Status = TaskStatusIdle
-				}
-			}
-		}
+		requeueExpiredTasks(c.MapTasks)
 		task.Status = Wait
 		return nil
 	}
 
 	if len(c.ReduceTasks) != 0 && c.hasMapTasksCompleted && c.hasReduceTasksCompleted == false {
-		for index, reduceTask := range c.ReduceTasks {
-			if reduceTask.Status == TaskStatusIdle {
-				c.ReduceTasks[index].TTL = time.Now().Add(5 * time.Second).UnixMilli()
-				c.ReduceTasks[index].Status = TaskStatusInProgress
-				task.Task = c.ReduceTasks[index]
-				task.Status = Task_
-				return nil
-			}
+		if assignIdleTask(c.ReduceTasks, task) {
+			return nil
 		}
-		c.hasReduceTasksCompleted = isReduceTasksCompleted(c.ReduceTasks)
+		c.hasReduceTasksCompleted = allTasksCompleted(c.ReduceTasks)
 	}
 
 	if c.hasReduceTasksCompleted == false {
-		for index, task := range c.ReduceTasks {
-			if task.Status == TaskStatusInProgress {
-				if time.Now().UnixMilli() > task.TTL {
-					c.ReduceTasks[index].Status = TaskStatusIdle
-				}
-			}
-		}
+		requeueExpiredTasks(c.ReduceTasks)
 		task.Status = Wait
 		return nil
 	}
@@ -91,19 +67,9 @@ func (c *Coordinator) ReportTaskCompletion(request *TaskCompletionRequest, reply
 
 	switch request.Type {
 	case TaskTypeMap:
-		for index, task := range c.MapTasks {
-			if task.ID == request.ID {
-				c.MapTasks[index].Status = TaskStatusCompleted
-				break
-			}
-		}
+		markTaskCompleted(c.MapTasks, request.ID)
 	case TaskTypeReduce:
-		for index, task := range c.ReduceTasks {
-			if task.ID == request.ID {
-				c.ReduceTasks[index].Status = TaskStatusCompleted
-				break
-			}
-		}
+		markTaskCompleted(c.ReduceTasks, request.ID)
 	}
 	return nil
 }
@@ -128,16 +94,11 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, task := range c.MapTasks {
-		if task.Status != TaskStatusCompleted {
-			return ret
-		}
+	if !allTasksCompleted(c.MapTasks) {
+		return ret
 	}
-
-	for _, task := range c.ReduceTasks {
-		if task.Status != TaskStatusCompleted {
-			return ret
-		}
+	if !allTasksCompleted(c.ReduceTasks) {
+		return ret
 	}
 
 	return true
@@ -180,18 +141,45 @@ func buildMapTask(filename string, index int, nReduce int, taskType TaskType, nM
 	return task
 }
 
-func isMapTasksCompleted(mapTasks []Task) bool {
-	for _, task := range mapTasks {
-		if task.Status != TaskStatusCompleted {
-			return false
+// assignIdleTask hands the first idle task to the worker. Returns true if one was assigned.
+func assignIdleTask(tasks []Task, reply *RequestTaskReply) bool {
+	for index, t := range tasks {
+		if t.Status == TaskStatusIdle {
+			tasks[index].TTL = time.Now().Add(5 * time.Second).UnixMilli()
+			tasks[index].Status = TaskStatusInProgress
+			reply.Task = tasks[index]
+			reply.Status = Task_
+			return true
 		}
 	}
-	return true
+	return false
 }
 
-func isReduceTasksCompleted(reduceTasks []Task) bool {
-	for _, task := range reduceTasks {
-		if task.Status != TaskStatusCompleted {
+// requeueExpiredTasks puts timed-out in-progress tasks back to idle.
+func requeueExpiredTasks(tasks []Task) {
+	for index, t := range tasks {
+		if t.Status == TaskStatusInProgress {
+			if time.Now().UnixMilli() > t.TTL {
+				tasks[index].Status = TaskStatusIdle
+			}
+		}
+	}
+}
+
+// markTaskCompleted marks the task with the given ID as completed.
+func markTaskCompleted(tasks []Task, id int) {
+	for index, t := range tasks {
+		if t.ID == id {
+			tasks[index].Status = TaskStatusCompleted
+			break
+		}
+	}
+}
+
+// allTasksCompleted reports whether every task is completed.
+func allTasksCompleted(tasks []Task) bool {
+	for _, t := range tasks {
+		if t.Status != TaskStatusCompleted {
 			return false
 		}
 	}
