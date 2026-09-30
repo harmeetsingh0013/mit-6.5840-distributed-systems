@@ -11,6 +11,7 @@ import (
 )
 
 type Coordinator struct {
+	mu          sync.Mutex
 	Tasks       []Task
 	MapTasks    []Task
 	ReduceTasks []Task
@@ -19,33 +20,33 @@ type Coordinator struct {
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) AssignTask(request Request, task *Task) error {
-	var mu sync.Mutex
+func (c *Coordinator) AssignTask(request RequestTask, task *Task) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if len(c.Tasks) == 0 {
 		log.Fatalf("No tasks available!")
 	}
 
-	fmt.Printf("Assigning task: %+v\n", c.Tasks[0])
-
-	mu.Lock()
 	*task = c.Tasks[0]
 	task.Status = TaskStatusInProgress
 	c.Tasks = c.Tasks[1:]
 	switch task.Type {
 	case TaskTypeMap:
+		fmt.Println("MapTask START", *task)
 		c.MapTasks = append(c.MapTasks, *task)
 	case TaskTypeReduce:
+		fmt.Println("ReduceTask START", *task)
 		c.ReduceTasks = append(c.ReduceTasks, *task)
 	}
-	mu.Unlock()
+
 	return nil
 }
 
-func (c *Coordinator) ReportTaskCompletion(taskID int, taskType TaskType) error {
-	var mu sync.Mutex
+func (c *Coordinator) ReportTaskCompletion(request *TaskCompletionRequest, reply *TaskCompletionReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	mu.Lock()
 	if len(c.Tasks) == 0 && len(c.ReduceTasks) == 0 && len(c.MapTasks) != 0 {
 		for i := 0; i < c.NReduce; i++ {
 			reduceTask := buildMapTask("", i, c.NReduce, TaskTypeReduce, c.NMap)
@@ -53,23 +54,22 @@ func (c *Coordinator) ReportTaskCompletion(taskID int, taskType TaskType) error 
 		}
 	}
 
-	switch taskType {
+	switch request.Type {
 	case TaskTypeMap:
 		for index, task := range c.MapTasks {
-			if task.ID == taskID {
+			if task.ID == request.ID {
 				c.MapTasks[index].Status = TaskStatusCompleted
 				break
 			}
 		}
 	case TaskTypeReduce:
 		for index, task := range c.ReduceTasks {
-			if task.ID == taskID {
+			if task.ID == request.ID {
 				c.ReduceTasks[index].Status = TaskStatusCompleted
 				break
 			}
 		}
 	}
-	mu.Unlock()
 	return nil
 }
 
@@ -89,6 +89,13 @@ func (c *Coordinator) server(sockname string) {
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	ret := false
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	fmt.Println("Tasks length: ", len(c.Tasks))
+	fmt.Println("MapTasks length: ", len(c.MapTasks))
+	fmt.Println("ReduceTasks length: ", len(c.ReduceTasks))
 
 	if len(c.Tasks) != 0 {
 		return ret

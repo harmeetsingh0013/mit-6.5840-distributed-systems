@@ -21,9 +21,7 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
-type Request struct {
-	WorkerId int
-}
+type RequestTask struct{}
 
 type TaskStatus string
 
@@ -49,9 +47,9 @@ type Task struct {
 	Type     TaskType
 }
 
-type ReduceTask struct {
-	ID        int
-	Status    TaskStatus
-	MapTaskId int
-	NReduce   int
+type TaskCompletionRequest struct {
+	ID   int
+	Type TaskType
 }
+
+type TaskCompletionReply struct{}

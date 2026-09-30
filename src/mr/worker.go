@@ -44,29 +44,42 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	request := &Request{}
+	request := &RequestTask{}
 	task := &Task{}
 
+	fmt.Println("AssignTask START")
 	ok := call("Coordinator.AssignTask", &request, &task)
 	if !ok {
 		fmt.Printf("Failed to get the Task!\n")
 	}
 
-	fmt.Println("Task: ", task)
-
+	fmt.Println("AssignTask Get", *task)
 	switch task.Type {
 	case TaskTypeMap:
 		if err := mapData(*task, mapf); err == nil {
-			ok = call("Coordinator.ReportTaskCompletion", &task.ID, &task.Type)
-			if !ok {
-				fmt.Printf("Failed to get the Task!\n")
+			taskCompletionRequest := &TaskCompletionRequest{
+				ID:   task.ID,
+				Type: task.Type,
 			}
+			taskCompletionReply := &TaskCompletionReply{}
+
+			fmt.Println("ReportTaskCompletion START → task: ", *task)
+			ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
+			if !ok {
+				fmt.Printf("Failed to Report Task Completion!\n")
+			}
+			fmt.Println("ReportTaskCompletion End → task: ", *task)
 		}
 	case TaskTypeReduce:
 		reduceData(*task, reducef)
-		ok = call("Coordinator.ReportTaskCompletion", &task.ID, &task.Type)
+		taskCompletionRequest := &TaskCompletionRequest{
+			ID:   task.ID,
+			Type: task.Type,
+		}
+		taskCompletionReply := &TaskCompletionReply{}
+		ok = call("Coordinator.ReportTaskCompletion", &taskCompletionRequest, &taskCompletionReply)
 		if !ok {
-			fmt.Printf("Failed to get the Task!\n")
+			fmt.Printf("Failed to Report Task Completion!\n")
 		}
 	}
 
@@ -86,6 +99,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err := c.Call(rpcname, args, reply); err == nil {
 		return true
 	}
+	fmt.Println(err)
 	log.Printf("%d: call failed err %v", os.Getpid(), err)
 	return false
 }
@@ -114,8 +128,6 @@ func mapData(task Task, mapf func(string, string) []KeyValue) error {
 			fmt.Println("Error encoding JSON to file:", err)
 			return err
 		}
-
-		fmt.Println("Data successfully encoded to data.json")
 	}
 
 	return nil
