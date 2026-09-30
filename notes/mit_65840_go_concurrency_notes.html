@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MIT 6.5840 — Go & Distributed Systems Notes</title><style>body{font-family:system-ui,sans-serif;max-width:950px;margin:auto;padding:2rem;line-height:1.6;background:#f7f7f8;color:#202124}section,header{background:white;border:1px solid #ddd;border-radius:12px;padding:1.5rem;margin:1rem 0}pre{background:#f1f3f4;padding:1rem;border-radius:8px;overflow:auto}code{font-family:ui-monospace,monospace}.tag{color:#174ea6;font-weight:700}li{margin:.35rem 0}.diagram{white-space:pre;overflow:auto;background:#f1f3f4;padding:1rem;border-radius:8px}</style></head><body>
+<header><div class="tag">MIT 6.5840 / 6.824 — Lab 1 Preparation</div><h1>Go & Distributed Systems Notes</h1><p>Interactive mentorship notes covering the Go concurrency concepts learned so far, with emphasis on the MapReduce lab.</p><p><strong>Approach:</strong> learn Go just-in-time for the lab rather than taking a giant Go course.</p></header>
+<section><h2>Contents</h2><ol><li>Goroutines</li><li>sync.WaitGroup</li><li>defer and LIFO</li><li>Shared state</li><li>Data races</li><li>sync.Mutex</li><li>Critical sections</li><li>Claiming shared work</li><li>Slow work outside the lock</li><li>Values, pointers, slices, and shared data</li><li>Concurrency reasoning workflow</li><li>MapReduce connection</li><li>Checkpoint before RPC</li></ol></section>
+<section><h2>1. Goroutines</h2><p class="tag">Classification: A — Go/concurrency</p><p><code>go f()</code> starts a function concurrently. It does not guarantee when it starts or finishes. Returning from <code>main</code> terminates the process even if other goroutines remain.</p><pre><code>work()      // normal call
+go work()   // concurrent execution</code></pre><p>A goroutine is managed by the Go runtime; it is not literally an OS thread. A Java virtual-thread analogy is useful but not exact.</p><p><strong>Rule:</strong> never depend on goroutine execution order unless synchronization establishes it.</p></section>
+<section><h2>2. sync.WaitGroup</h2><p class="tag">Classification: A — Go/concurrency</p><p>A WaitGroup answers: “Have these goroutines finished?”</p><pre><code>var wg sync.WaitGroup
+wg.Add(1)
+go func() {
+    defer wg.Done()
+    // work
+}()
+wg.Wait()</code></pre><ul><li><code>Add(1)</code>: register work</li><li><code>Done()</code>: report completed work</li><li><code>Wait()</code>: block until the counter reaches zero</li></ul><p>It does not start goroutines, protect shared state, make operations atomic, or communicate arbitrary values.</p><p><strong>Important:</strong> <code>Done()</code> must mean the work is actually finished. Calling it at the start of a worker reports completion too early.</p></section>
+<section><h2>3. defer and LIFO</h2><p class="tag">Classification: A — Go</p><p><code>defer</code> schedules a call when the surrounding function returns. Multiple defers execute LIFO.</p><pre><code>defer A()
+defer B()
+// return
+B()
+A()</code></pre><p>For:</p><pre><code>defer wg.Done()
+mu.Lock()
+defer mu.Unlock()</code></pre><p>the return-time order is <code>mu.Unlock()</code>, then <code>wg.Done()</code>.</p></section>
+<section><h2>4. Shared state</h2><p class="tag">Classification: A — Go; C — MapReduce</p><p>Shared state is data multiple goroutines can access, such as <code>counter</code>, <code>tasks</code>, or <code>task.status</code>.</p><p><strong>First question:</strong> Can multiple goroutines access this data concurrently?</p></section>
+<section><h2>5. Data races</h2><p class="tag">Classification: A — Go/concurrency</p><p>A data race occurs when concurrent goroutines access the same memory, at least one access is a write, without appropriate synchronization.</p><pre><code>counter++</code></pre><p>Although one line, an increment conceptually involves read → add → write. Concurrent increments can interfere.</p><pre><code>go run -race main.go</code></pre><p>We used the race detector and saw <code>Found 2 data race(s)</code>.</p><p><strong>Rule:</strong> one source-code statement is not necessarily one atomic operation.</p></section>
+<section><h2>6. sync.Mutex</h2><p class="tag">Classification: A — Go/concurrency</p><pre><code>mu.Lock()
+// critical section
+mu.Unlock()</code></pre><p>Idiomatic form:</p><pre><code>mu.Lock()
+defer mu.Unlock()
+// critical section</code></pre><table><tr><th>Tool</th><th>Question</th></tr><tr><td>WaitGroup</td><td>Are these goroutines finished?</td></tr><tr><td>Mutex</td><td>Who may access this protected shared state right now?</td></tr></table></section>
+<section><h2>7. Critical sections</h2><p class="tag">Classification: A — Go; C — MapReduce</p><p>A critical section is the code that accesses/modifies protected shared state.</p><pre><code>mu.Lock()
+task := tasks[0]
+tasks = tasks[1:]
+mu.Unlock()</code></pre><p><strong>Rule:</strong> hold a lock only as long as necessary to maintain the shared-state invariant.</p><p>Do not keep a mutex locked across unrelated slow work such as a sleep, network operation, or long computation unless that operation genuinely requires the protected state.</p></section>
+<section><h2>8. Claiming shared work</h2><p class="tag">Classification: C — Go concurrency + MapReduce</p><p>This is a check-then-act operation:</p><pre><code>if task.status == "Idle" {
+    task.status = "Running"
+}</code></pre><p>The check and update must be protected together:</p><pre><code>mu.Lock()
+if task.status == "Idle" {
+    task.status = "Running"
+}
+mu.Unlock()</code></pre><p>Otherwise two workers can both observe <code>Idle</code> and both believe they claimed the task.</p><p><strong>Rule:</strong> protect the whole logical operation, not merely one line of it.</p></section>
+<section><h2>9. Slow work outside the lock</h2><pre><code>mu.Lock()
+if task.status == "Idle" {
+    task.status = "Running"
+}
+mu.Unlock()
+
+doSomethingSlow(task)</code></pre><p>After the shared state has been safely updated, the slow work can often proceed without the mutex. This lets another goroutine claim another task instead of waiting for the first worker’s slow operation.</p><p><strong>Rule:</strong> protect shared state, not arbitrary work.</p></section>
+<section><h2>10. Values, pointers, slices, and shared data</h2><p class="tag">Classification: A — Go</p><p>Go passes arguments by value, but a copied value can still refer to shared underlying data.</p><pre><code>func change(s []int) {
+    s[0] = 100
+}</code></pre><p>The slice header is copied, but the underlying array can still be shared. Therefore, synchronization decisions should be based on whether underlying data can be accessed concurrently—not merely on “pass by value.”</p></section>
+<section><h2>11. Concurrency reasoning workflow</h2><div class="diagram">Write concurrent code
+        ↓
+Identify shared state
+        ↓
+Identify the invariant
+        ↓
+Identify the critical section
+        ↓
+Protect it with synchronization
+        ↓
+Keep the critical section small
+        ↓
+Run with the race detector
+        ↓
+Interpret the result</div><ol><li>Which goroutines can run concurrently?</li><li>What state do they share?</li><li>Who reads and writes it?</li><li>Can check-then-act be interrupted?</li><li>What invariant must remain true?</li><li>How much code actually needs the lock?</li></ol></section>
+<section><h2>12. Connection to MapReduce</h2><p class="tag">Classification: C — both</p><p>The MapReduce coordinator will maintain shared task state while multiple goroutines handle concurrent work.</p><div class="diagram">Coordinator
+   │
+   ├── shared task state
+   │       └── task status
+   │
+   └── concurrent goroutines
+           │
+           └── Mutex protects state</div><p>A typical reasoning pattern is:</p><pre><code>Lock
+  inspect shared state
+  make decision
+  update shared state
+Unlock
+perform slow/non-shared work</code></pre><p>We are deliberately postponing channels, select, RWMutex, atomics, and other advanced topics until the lab requires them.</p></section>
+<section><h2>13. Checkpoint before RPC</h2><table><tr><th>Concept</th><th>Core question</th></tr><tr><td>Goroutine</td><td>How do I execute work concurrently?</td></tr><tr><td>WaitGroup</td><td>How do I wait for goroutines to finish?</td></tr><tr><td>Mutex</td><td>How do I protect shared state?</td></tr><tr><td>Critical section</td><td>What exact state-changing operation needs protection?</td></tr><tr><td>Race detector</td><td>Does the program contain unsynchronized concurrent memory access?</td></tr></table><p><strong>Next topic: RPC.</strong> We will start with the distributed-systems model: <strong>client process → network → server process → request handling → reply</strong>, then map that model to Go’s <code>net/rpc</code>.</p></section>
+</body></html>

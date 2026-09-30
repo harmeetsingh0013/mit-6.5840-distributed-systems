@@ -1,17 +1,29 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"strconv"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
-	Key   string
-	Value string
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -23,7 +35,6 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
@@ -33,35 +44,32 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	request := &Request{}
+	task := &Task{}
 
-}
-
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+	ok := call("Coordinator.AssignTask", &request, &task)
+	if !ok {
+		fmt.Printf("Failed to get the Task!\n")
 	}
+
+	fmt.Println("Task: ", task)
+
+	switch task.Type {
+	case TaskTypeMap:
+		if err := mapData(*task, mapf); err == nil {
+			ok = call("Coordinator.ReportTaskCompletion", &task.ID, &task.Type)
+			if !ok {
+				fmt.Printf("Failed to get the Task!\n")
+			}
+		}
+	case TaskTypeReduce:
+		reduceData(*task, reducef)
+		ok = call("Coordinator.ReportTaskCompletion", &task.ID, &task.Type)
+		if !ok {
+			fmt.Printf("Failed to get the Task!\n")
+		}
+	}
+
 }
 
 // send an RPC request to the coordinator, wait for the response.
@@ -80,4 +88,78 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	log.Printf("%d: call failed err %v", os.Getpid(), err)
 	return false
+}
+
+func mapData(task Task, mapf func(string, string) []KeyValue) error {
+	filename, content := readFile(task.FileName)
+	kva := mapf(filename, string(content))
+
+	partions := make(map[int][]KeyValue)
+
+	for _, kv := range kva {
+		reduceTaskNumber := ihash(kv.Key) % task.NReduce
+		partions[reduceTaskNumber] = append(partions[reduceTaskNumber], kv)
+	}
+
+	for reduceTaskNumber, kvs := range partions {
+		outputFileName := fmt.Sprintf("mr-%d-%d", task.ID, reduceTaskNumber)
+		file, err := os.Create(outputFileName)
+		if err != nil {
+			log.Fatalf("cannot create %v", outputFileName)
+		}
+		defer file.Close()
+		encoder := json.NewEncoder(file)
+
+		if err := encoder.Encode(kvs); err != nil {
+			fmt.Println("Error encoding JSON to file:", err)
+			return err
+		}
+
+		fmt.Println("Data successfully encoded to data.json")
+	}
+
+	return nil
+}
+
+func reduceData(task Task, reducef func(string, []string) string) error {
+	values := make([]string, 0)
+	oname := "mr-out-" + strconv.Itoa(task.ID)
+	ofile, _ := os.Create(oname)
+
+	for i := 0; i < task.NMap; i++ {
+		inputFileName := fmt.Sprintf("mr-%d-%d", i, task.ID)
+		file, err := os.Open(inputFileName)
+		if err != nil {
+			log.Fatalf("cannot open %v", inputFileName)
+		}
+		defer file.Close()
+
+		var kva []KeyValue
+		decoder := json.NewDecoder(file)
+		if err := decoder.Decode(&kva); err != nil {
+			fmt.Println("Error decoding JSON from file:", err)
+			return err
+		}
+
+		for _, kv := range kva {
+			values = append(values, kv.Value)
+		}
+	}
+
+	result := reducef(strconv.Itoa(task.ID), values)
+	fmt.Fprintf(ofile, "%v %v\n", strconv.Itoa(task.ID), result)
+	return nil
+}
+
+func readFile(filename string) (string, string) {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	return filename, string(content)
 }
