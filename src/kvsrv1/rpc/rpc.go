@@ -22,6 +22,7 @@ type PutArgs struct {
 	Key     string
 	Value   string
 	Version Tversion
+	Retry   bool
 }
 
 type PutReply struct {
@@ -37,4 +38,3 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
-

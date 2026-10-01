@@ -57,7 +57,10 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	defer kv.mu.Unlock()
 	value, ok := kv.records[args.Key]
 	if ok {
-		if args.Version != value.Version {
+		if args.Version != value.Version && args.Retry {
+			reply.Err = rpc.ErrMaybe
+			return
+		} else if args.Version != value.Version {
 			reply.Err = rpc.ErrVersion
 			return
 		}

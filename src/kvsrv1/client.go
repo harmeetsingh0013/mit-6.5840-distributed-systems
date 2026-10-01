@@ -1,7 +1,7 @@
 package kvsrv
 
 import (
-	"fmt"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -33,16 +33,19 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	getRequest := rpc.GetArgs{Key: key}
 	getReply := rpc.GetReply{}
 
-	ok := ck.clnt.Call(ck.server, "KVServer.Get", &getRequest, &getReply)
-	if !ok {
-		fmt.Println("Get request fails..")
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", &getRequest, &getReply)
+		if !ok {
+			continue
+		}
+
+		if getReply.Err == rpc.ErrNoKey {
+			return "", 0, rpc.ErrNoKey
+		}
+
+		return getReply.Value, getReply.Version, rpc.OK
 	}
 
-	if getReply.Err == rpc.ErrNoKey {
-		return "", 0, rpc.ErrNoKey
-	}
-
-	return getReply.Value, getReply.Version, rpc.OK
 }
 
 // Put updates key with value only if the version in the
@@ -65,12 +68,16 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	putRequest := rpc.PutArgs{Key: key, Value: value, Version: version}
 	putReply := rpc.PutReply{}
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", &putRequest, &putReply)
 
-	ok := ck.clnt.Call(ck.server, "KVServer.Put", &putRequest, &putReply)
+		if !ok {
+			putRequest.Retry = true
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 
-	if !ok {
-		fmt.Println("Put request fails..")
+		return putReply.Err
 	}
 
-	return putReply.Err
 }
