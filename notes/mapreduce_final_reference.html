@@ -1,0 +1,471 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MapReduce — Final Reference & Learning Notes</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.6;max-width:1000px;margin:40px auto;padding:0 24px;color:#202124}
+h1{border-bottom:3px solid #333;padding-bottom:10px}h2{margin-top:42px;border-bottom:1px solid #ccc;padding-bottom:6px}
+h3{margin-top:28px}pre{background:#f6f7f8;border:1px solid #ddd;border-radius:7px;padding:14px;overflow:auto}
+code{background:#f1f3f4;padding:2px 5px;border-radius:4px}table{border-collapse:collapse;width:100%;margin:16px 0}
+th,td{border:1px solid #ccc;padding:9px;vertical-align:top;text-align:left}th{background:#f6f7f8}
+.box{padding:14px 17px;margin:18px 0;background:#f6f7f8;border-left:4px solid #777}
+.blue{background:#eef6ff;border-left-color:#3578c7}.green{background:#edf8f0;border-left-color:#3b8c57}
+.yellow{background:#fff7df;border-left-color:#b88300}.muted{color:#666;font-size:.92rem}
+</style></head><body>
+<h1>MapReduce — Final Reference & Learning Notes</h1>
+<p class="muted">A consolidated future reference for MIT 6.5840/6.824 MapReduce: concepts, implementation reasoning, debugging lessons, and distributed-systems insights learned during the lab.</p>
+
+<div class="box blue"><b>Purpose:</b> This is a reference, not a transcript. It emphasizes mental models, invariants, mistakes, and the reasoning that makes the implementation understandable.</div>
+
+<h2>1. Core Mental Model</h2>
+<p>MapReduce separates a large computation into two distributed stages:</p>
+<pre>Input files
+    |
+    v
++------------+
+| MAP PHASE  |
++------------+
+    |
+    | intermediate key/value pairs
+    | partitioned by key
+    v
+Intermediate files
+    |
+    | after ALL Map tasks finish
+    v
++-------------+
+| REDUCE PHASE|
++-------------+
+    |
+    v
+Final output files</pre>
+<p>The application supplies <code>mapf</code> and <code>reducef</code>. The framework handles distribution, scheduling, partitioning, grouping, file organization, and recovery.</p>
+<div class="box green"><b>Core lesson:</b> MapReduce is not primarily a word-count algorithm. It is a framework for distributing computation over large data while deterministically routing intermediate results to the correct Reduce task.</div>
+
+<h2>2. Architecture</h2>
+<table><tr><th>Component</th><th>Responsibility</th></tr>
+<tr><td>Coordinator / Master</td><td>Owns task state, assigns work, controls Map → Reduce phases, handles WAIT/EXIT, and detects/reassigns stale work.</td></tr>
+<tr><td>Worker</td><td>Requests work, executes Map or Reduce, performs file I/O, and reports completion.</td></tr>
+<tr><td>Map function</td><td>Application logic: input → <code>[]KeyValue</code>.</td></tr>
+<tr><td>Reduce function</td><td>Application logic: <code>(key, []values) → result</code>.</td></tr></table>
+
+<p>The Worker does not decide whether it should do Map or Reduce. The Coordinator assigns a typed task.</p>
+
+<pre>Coordinator
+    |
+    +-- choose task
+    +-- change task state
+    +-- return task
+    |
+    v
+Worker
+    |
+    +-- mapf/reducef
+    +-- file I/O
+    |
+    +-- report completion</pre>
+
+<div class="box blue"><b>Important:</b> The Coordinator is a scheduler/state manager, not the computation engine. Do not hold its mutex while executing Map or Reduce.</div>
+
+<h2>3. Map Phase</h2>
+<pre>Map task X
+  |
+  +-- read input file
+  +-- mapf(filename, contents)
+  +-- []KeyValue
+  +-- partition each key
+  +-- write intermediate files
+  +-- report completion</pre>
+<p>Example Map output:</p>
+<pre>("his","1")
+("cat","1")
+("his","1")
+("dog","1")</pre>
+
+<h2>4. Partitioning</h2>
+<p>The key routing rule is:</p>
+<pre>partition = ihash(key) % nReduce</pre>
+<p>Therefore every occurrence of the same key goes to the same Reduce partition, even when produced by different Map tasks.</p>
+<pre>"his" -> partition 3
+"his" -> partition 3
+"his" -> partition 3</pre>
+<div class="box green"><b>Why?</b> A Reduce task must see all values for a key in order to compute the final result for that key.</div>
+
+<h2>5. Intermediate Files</h2>
+<p>Use the mental model:</p>
+<pre>mr-X-Y
+  | |
+  | +-- Reduce partition Y
+  +---- Map task X</pre>
+<p>If there are 8 Map tasks and 10 Reduce tasks, these are possible files:</p>
+<pre>mr-0-0 ... mr-0-9
+mr-1-0 ... mr-1-9
+...
+mr-7-0 ... mr-7-9</pre>
+<p>They do not all need to exist.</p>
+
+<h3>What does Reduce Y read?</h3>
+<pre>Reduce 0:
+    mr-0-0
+    mr-1-0
+    ...
+    mr-7-0
+
+Reduce 1:
+    mr-0-1
+    mr-1-1
+    ...
+    mr-7-1</pre>
+<p>General rule: <b>Reduce Y reads <code>mr-X-Y</code> for every Map task X.</b></p>
+<div class="box yellow"><b>Common confusion:</b> <code>mr-1-0</code> means Map task 1, Reduce partition 0. The first number is the Map number.</div>
+
+<h3>Empty partitions</h3>
+<p>A Map task may produce zero records for a particular partition. If your implementation creates files only for non-empty partitions, a missing file can legitimately mean an empty partition.</p>
+<pre>if errors.Is(err, os.ErrNotExist) {
+    continue // valid empty partition
+}
+if err != nil {
+    return err // real error
+}</pre>
+
+<h2>6. Reduce Phase</h2>
+<p>Reduce begins only after all Map tasks have completed.</p>
+<pre>all Map tasks Completed
+          |
+          v
+    Reduce phase</pre>
+<p>Reduce task Y:</p>
+<ol><li>Reads <code>mr-X-Y</code> for every Map task X.</li><li>Collects records.</li><li>Groups values by key.</li><li>Calls <code>reducef(key, values)</code>.</li><li>Writes <code>mr-out-Y</code>.</li><li>Reports completion.</li></ol>
+
+<h3>Grouping is framework work</h3>
+<p>This was an important early confusion. The framework conceptually transforms:</p>
+<pre>("his","1")
+("his","1")
+("his","1")
+("cat","1")</pre>
+<p>into:</p>
+<pre>"his" -> ["1","1","1"]
+"cat" -> ["1"]</pre>
+<p>and then calls:</p>
+<pre>reducef("his", ["1","1","1"])
+reducef("cat", ["1"])</pre>
+<p>The application Reduce function does not search across all files for occurrences of a key.</p>
+
+<h3>Final output</h3>
+<p>There is one final file per Reduce task:</p>
+<pre>mr-out-0
+mr-out-1
+...
+mr-out-(nReduce-1)</pre>
+<p>It is not one file per word. Each file contains all results belonging to that Reduce partition.</p>
+
+<h2>7. nMap and nReduce</h2>
+<table><tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><code>nMap</code></td><td>Total Map tasks; typically one per input file in the lab.</td></tr>
+<tr><td><code>nReduce</code></td><td>Total Reduce tasks / partitions.</td></tr></table>
+
+<h2>8. Coordinator State Machine</h2>
+<pre>             +------+
+             | Idle |
+             +------+
+                |
+              assign
+                v
+         +--------------+
+         | InProgress   |
+         +--------------+
+            |        |
+       complete     stale
+            |        |
+            v        v
+      +-----------+ +------+
+      | Completed | | Idle |
+      +-----------+ +------+</pre>
+
+<p>Overall phase progression:</p>
+<pre>MAP PHASE
+   |
+   | every Map completed
+   v
+REDUCE PHASE
+   |
+   | every Reduce completed
+   v
+EXIT</pre>
+
+<p>A useful invariant is:</p>
+<pre>Map phase complete
+    iff every Map task is Completed
+
+Reduce phase complete
+    iff every Reduce task is Completed</pre>
+
+<p>If you store both task states and separate completion booleans, keep them consistent. The task states are the authoritative conceptual state.</p>
+
+<h2>9. Worker State Machine</h2>
+<pre>             RequestTask
+                  |
+       +----------+----------+
+       |          |          |
+      TASK       WAIT       EXIT
+       |          |          |
+    execute     sleep       return
+       |
+   completion
+       |
+       v
+request again</pre>
+<table><tr><th>Response</th><th>Worker action</th></tr>
+<tr><td>TASK</td><td>Execute, report completion, request again.</td></tr>
+<tr><td>WAIT</td><td>Sleep briefly and retry.</td></tr>
+<tr><td>EXIT</td><td>Terminate.</td></tr></table>
+
+<p>WAIT is important: there may be no currently Idle task even though existing tasks are still running.</p>
+
+<h2>10. RPC, Goroutines, and Mutexes</h2>
+<p>Go RPC handlers can run concurrently. Two Workers can request work at the same time.</p>
+<pre>Worker A -> sees Task 0 Idle
+Worker B -> sees Task 0 Idle
+
+A assigns Task 0
+B assigns Task 0   <-- race/bug</pre>
+<p>The Coordinator needs a shared mutex around the check-and-update:</p>
+<pre>lock
+    inspect task
+    Idle -> InProgress
+    prepare reply
+unlock</pre>
+<p>Do the expensive Map/Reduce work outside the lock.</p>
+<div class="box green"><b>Distributed-systems lesson:</b> Protect the shared state transition, not the expensive computation.</div>
+
+<h2>11. Worker Failure and Reassignment</h2>
+<p>If a Worker gets a task and crashes before reporting completion:</p>
+<pre>Worker A gets Map 3
+       |
+       v
+Map 3 = InProgress
+       |
+   Worker A crashes
+       |
+       X no completion RPC</pre>
+<p>Without failure detection, Map 3 remains InProgress forever.</p>
+<p>The Coordinator therefore needs a mechanism to eventually do:</p>
+<pre>InProgress -> Idle -> reassign</pre>
+
+<h3>Health checks vs. task timeout</h3>
+<p>The original Google MapReduce paper discusses the Master periodically checking worker health. A lab implementation can instead track how long an individual task has been InProgress.</p>
+<table><tr><th>Mechanism</th><th>Question</th></tr>
+<tr><td>Worker health check</td><td>Is this Worker alive?</td></tr>
+<tr><td>Task timeout</td><td>Has this task been running too long without completion?</td></tr></table>
+
+<p>These are related but different mechanisms.</p>
+
+<h3>Scheduler interval is not timeout</h3>
+<pre>scheduler interval = how often I inspect tasks
+task timeout       = how long before I consider a task stale</pre>
+<p>For example, a scheduler could check every 200 ms while using a much larger failure threshold. Do not automatically make the check interval the timeout.</p>
+<p>The exact timeout should be taken from the lab version/specification being used; do not rely on a remembered number from an older version.</p>
+
+<h3>TTL and Go struct copies</h3>
+<p>A subtle bug appeared when adding TTL metadata. This:</p>
+<pre>task.Task = c.MapTasks[index]</pre>
+<p>copies the struct. Updating:</p>
+<pre>task.Task.TTL = ...</pre>
+<p>updates the RPC reply copy, not the Coordinator's stored task. If the Coordinator later checks <code>c.MapTasks[index].TTL</code>, it will not see that update.</p>
+<div class="box yellow"><b>General Go lesson:</b> When structs are assigned by value, always ask which copy is authoritative.</div>
+
+<h3>Late completion and duplicate execution</h3>
+<p>Failure detection is imperfect. A slow Worker can look dead:</p>
+<pre>t=0       Worker A starts Map 3
+          |
+timeout   Coordinator reassigns Map 3
+          |
+          v
+          Worker B starts Map 3
+          |
+late      Worker A finishes</pre>
+<p>Now the same logical task may execute twice. This is normal territory for distributed systems: retries can create duplicate execution.</p>
+
+<h2>12. Test Lessons</h2>
+<h3>TestMapParallel</h3>
+<p>Tests concurrency, not just final output. Holding the Coordinator mutex while executing Map would serialize work and defeat the intended behavior.</p>
+
+<h3>TestCrashWorker</h3>
+<p>Tests whether a task abandoned by a failed Worker can eventually be retried. An InProgress task that is never reclaimed can make the whole job hang.</p>
+
+<h3>TestJobCount</h3>
+<p>Tests execution behavior. It exposes unnecessary re-execution. If healthy tasks are incorrectly classified as stale, they can run more times than expected.</p>
+<div class="box learning"><b>Important insight:</b> Correct final output is not the only notion of correctness. A distributed system can produce correct output while still having incorrect task counts, races, poor concurrency, or failure-handling bugs.</div>
+
+<h2>13. Confusions and Their Final Answers</h2>
+<table>
+<tr><th>Question / confusion</th><th>Final mental model</th></tr>
+<tr><td>Does Reduce group values?</td><td>The framework groups values by key before calling the user Reduce function.</td></tr>
+<tr><td>Does Reduce 0 read one file?</td><td>No. It reads <code>mr-X-0</code> from every Map X.</td></tr>
+<tr><td>Do all intermediate files have to exist?</td><td>No. Empty partitions can be represented by missing files in a sparse implementation.</td></tr>
+<tr><td>One output file per word?</td><td>No. One output file per Reduce task/partition.</td></tr>
+<tr><td>Who gives the input filename?</td><td>The Coordinator gives it in the assigned task.</td></tr>
+<tr><td>Who chooses Map vs Reduce?</td><td>The Coordinator, through the task type.</td></tr>
+<tr><td>Why WAIT?</td><td>No Idle task is currently available, but work is still running.</td></tr>
+<tr><td>Can the Coordinator lock while Map runs?</td><td>No; expensive work belongs outside the critical section.</td></tr>
+<tr><td>Is 200 ms automatically the timeout?</td><td>No; scheduler interval and failure threshold are different.</td></tr>
+<tr><td>Why can TTL fail unexpectedly?</td><td>Because the RPC task is a struct copy; Coordinator-owned state must be updated.</td></tr>
+<tr><td>Why does a crash cause a hang?</td><td>The task can remain InProgress forever unless stale work is reclaimed.</td></tr>
+<tr><td>Why can JobCount fail after adding retries?</td><td>Over-aggressive failure detection can re-run healthy/slow tasks.</td></tr>
+</table>
+
+<h2>14. Implementation Checklist</h2>
+<h3>Map</h3>
+<pre>[ ] One Map task per input file
+[ ] Worker receives input filename
+[ ] Call mapf
+[ ] ihash(key) % nReduce
+[ ] Write deterministic mr-X-Y files
+[ ] Report completion</pre>
+
+<h3>Reduce</h3>
+<pre>[ ] Start only after all Maps complete
+[ ] Reduce Y reads mr-X-Y for every X
+[ ] Missing sparse file = empty partition
+[ ] Group values by key
+[ ] Call reducef(key, values)
+[ ] Write one mr-out-Y
+[ ] Report completion</pre>
+
+<h3>Coordinator</h3>
+<pre>[ ] Track Map and Reduce tasks
+[ ] Protect shared state with one mutex
+[ ] Assign Idle tasks
+[ ] Keep Map before Reduce
+[ ] Return WAIT when appropriate
+[ ] Reclaim stale InProgress tasks
+[ ] Return EXIT after all work completes
+[ ] Keep completion state consistent</pre>
+
+<h3>Worker</h3>
+<pre>[ ] Request task
+[ ] TASK -> execute
+[ ] WAIT -> sleep/retry
+[ ] EXIT -> terminate
+[ ] Report successful completion
+[ ] Execute outside Coordinator lock</pre>
+
+<h2>15. What MapReduce Taught About Distributed Systems</h2>
+<ul>
+<li><b>RPC is unreliable communication:</b> remote calls can fail or be delayed.</li>
+<li><b>Failure is normal:</b> workers can disappear without completing their work.</li>
+<li><b>Concurrency creates races:</b> multiple RPC handlers can touch the same state simultaneously.</li>
+<li><b>State machines help reasoning:</b> explicit task states make legal transitions visible.</li>
+<li><b>Failure detection is imperfect:</b> slow and dead are not immediately distinguishable.</li>
+<li><b>Retries can duplicate work:</b> re-execution must be tolerated.</li>
+<li><b>Deterministic naming reduces coordination:</b> both sides can derive <code>mr-X-Y</code> without exchanging every filename.</li>
+<li><b>Correctness includes behavior:</b> output, concurrency, task count, races, and recovery all matter.</li>
+<li><b>Ownership matters:</b> one component should have authoritative state.</li>
+</ul>
+
+<h2>16. The Most Useful Debugging Questions</h2>
+<p>When a MapReduce test fails, ask these in order:</p>
+<ol>
+<li><b>What state transition was supposed to happen?</b></li>
+<li><b>What state transition actually happened?</b></li>
+<li><b>Which component owns that state?</b></li>
+<li><b>Could two goroutines access it concurrently?</b></li>
+<li><b>Could a Worker have failed or simply been slow?</b></li>
+<li><b>Could the same task have executed twice?</b></li>
+<li><b>Is the failure about output, liveness, concurrency, or execution count?</b></li>
+</ol>
+
+<h2>17. One-Page Cheat Sheet</h2>
+<pre>MAPREDUCE
+
+Input files
+    |
+    v
+Map task X
+    |
+    | mapf
+    v
+KeyValue pairs
+    |
+    | ihash(key) % nReduce
+    v
+mr-X-Y
+    |
+    | all Maps complete
+    v
+Reduce task Y
+    |
+    | read mr-X-Y for every X
+    v
+group by key
+    |
+    | reducef(key, values)
+    v
+mr-out-Y
+
+
+TASK STATES
+
+Idle -> InProgress -> Completed
+             |
+             +---- stale ----> Idle
+
+
+PHASES
+
+MAP -> all Maps complete -> REDUCE -> all Reduces complete -> EXIT
+
+
+WORKER RESPONSES
+
+TASK -> execute -> report -> request again
+WAIT -> sleep -> request again
+EXIT -> terminate
+
+
+CORE INVARIANTS
+
+1. Same key -> same Reduce partition
+2. Reduce starts only after all Maps finish
+3. Reduce Y reads partition Y from every Map X
+4. One Reduce task -> one final output file
+5. Coordinator shared state -> mutex protected
+6. Expensive computation -> outside Coordinator mutex
+7. Stale tasks -> eventually retryable
+8. Slow Worker may look like failed Worker
+9. Retry can cause duplicate execution
+10. Coordinator owns authoritative task state</pre>
+
+<h2>18. Final Mental Model</h2>
+<div class="box green">
+<p><b>MapReduce is a distributed execution framework.</b></p>
+<p>The Coordinator turns a large computation into independently executable tasks. Workers execute those tasks concurrently. Map workers produce intermediate key/value data and deterministically partition it by key. After every Map task finishes, Reduce workers collect their partition from every Map task, group values by key, and produce one output file per Reduce partition. The Coordinator synchronizes task state, handles concurrent requests, and recovers from workers that disappear or become stale.</p>
+<p>The deeper lesson is that the Map and Reduce functions are usually the easy part. The difficult part is coordinating concurrent machines when communication can fail, machines can disappear, and the same work may need to be performed more than once.</p>
+</div>
+
+<h2>19. Bridge to the Next Topics</h2>
+<pre>MapReduce
+    |
+    | distributed computation
+    v
+GFS
+    |
+    | distributed storage + replication + failure recovery
+    v
+Replicated Key/Value Service
+    |
+    | shared mutable state + consistency + failures
+    v
+Consensus / Raft</pre>
+<p>Carry these questions into the next labs:</p>
+<pre>What state exists?
+Who owns that state?
+Who may modify it?
+What happens concurrently?
+What happens if a machine crashes?
+What if a message is lost?
+What if a message is duplicated?
+How do replicas agree?
+What does the client observe?</pre>
+
+<p class="muted">End of MapReduce reference.</p>
+</body></html>

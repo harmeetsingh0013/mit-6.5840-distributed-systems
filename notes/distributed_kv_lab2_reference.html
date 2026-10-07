@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIT 6.5840 — Distributed KV Server & Distributed Lock Reference</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#20242a;--muted:#5d6672;--card:#fff;--border:#dfe3e8;--code:#202632;--accent:#315fc4;--good:#176b3a;--warn:#8a5a00}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.65}main{max-width:1050px;margin:36px auto;padding:0 24px 70px}h1{font-size:2.25rem;line-height:1.15;margin-bottom:8px}h2{margin-top:44px;border-bottom:1px solid var(--border);padding-bottom:8px}h3{margin-top:28px}.subtitle{color:var(--muted);font-size:1.08rem}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px 22px;margin:18px 0;box-shadow:0 1px 2px #0000000a}.diagram,pre{background:var(--code);color:#e9edf3;border-radius:9px;padding:16px;overflow:auto;line-height:1.45}code{background:#edf0f4;border-radius:4px;padding:2px 5px}pre code{background:none;padding:0}.good{border-left:4px solid var(--good);padding-left:14px}.warn{border-left:4px solid var(--warn);padding-left:14px}table{width:100%;border-collapse:collapse;background:#fff;margin:16px 0}th,td{border:1px solid var(--border);padding:9px 11px;text-align:left;vertical-align:top}th{background:#eef1f5}.toc a{color:var(--accent);text-decoration:none}.small{color:var(--muted);font-size:.92rem}.tag{display:inline-block;background:#e8efff;color:#24499b;border-radius:999px;padding:3px 9px;margin:2px;font-size:.84rem}blockquote{border-left:4px solid var(--border);padding-left:16px;color:#454c55}.qa{background:#fafbfc;border:1px solid var(--border);padding:14px 16px;border-radius:9px;margin:12px 0}.answer{color:var(--good)}footer{margin-top:50px;padding-top:18px;border-top:1px solid var(--border);color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>MIT 6.5840 Distributed Systems<br>Distributed Key/Value Server & Distributed Lock</h1>
+<p class="subtitle">A long-term learning reference based on the Lab 2 discussions: KV state, concurrency, versions, conditional updates, unreliable RPC, retries, <code>ErrMaybe</code>, distributed mutual exclusion, and ownership.</p>
+
+<div class="card">
+<strong>How to use this document</strong>
+<p>This is a conceptual reference, not a lab solution. The goal is to reconstruct <em>why</em> the protocol works when returning to the material later.</p>
+<p><span class="tag">State</span><span class="tag">Ownership</span><span class="tag">Concurrency</span><span class="tag">Failure</span><span class="tag">Message loss</span><span class="tag">Retries</span><span class="tag">Consistency</span></p>
+</div>
+
+<div class="card toc"><strong>Contents</strong><ol>
+<li><a href="#history">Learning history and progression</a></li>
+<li><a href="#mental">The distributed-systems mental model</a></li>
+<li><a href="#kv">Key/value server</a></li>
+<li><a href="#mutex">Local mutex vs distributed coordination</a></li>
+<li><a href="#version">Versions and conditional Put</a></li>
+<li><a href="#race">Get → decision → Put race</a></li>
+<li><a href="#network">Unreliable RPC and retries</a></li>
+<li><a href="#maybe">ErrMaybe and epistemic uncertainty</a></li>
+<li><a href="#lock">Distributed lock</a></li>
+<li><a href="#ownership">Lock name vs owner ID</a></li>
+<li><a href="#acquire">Acquire under unreliable communication</a></li>
+<li><a href="#release">Release and ownership</a></li>
+<li><a href="#examples">Worked timelines</a></li>
+<li><a href="#findings">Findings and learning breakthroughs</a></li>
+<li><a href="#mistakes">Misconceptions that were corrected</a></li>
+<li><a href="#open">Open questions / future review</a></li>
+<li><a href="#bridge">Bridge to Raft</a></li>
+<li><a href="#checklist">Final review checklist</a></li>
+</ol></div>
+
+<h2 id="history">1. Learning History and Progression</h2>
+<div class="card"><ol>
+<li><strong>Started with a local mutex.</strong> This established the difference between protecting local Go memory and coordinating distributed clients.</li>
+<li><strong>Moved to KV-backed locking.</strong> The logical lock became shared state stored in the KV service.</li>
+<li><strong>Discovered the race in Get → Put.</strong> Two clients can both observe FREE unless the Put is conditional.</li>
+<li><strong>Learned versions.</strong> A version records which state a client observed and lets the server reject stale updates.</li>
+<li><strong>Passed the reliable lock tests.</strong> This established the basic conditional state-transition protocol.</li>
+<li><strong>Encountered unreliable RPC.</strong> Retries introduced the deeper problem: the client may not know whether a mutation happened.</li>
+<li><strong>Understood ErrMaybe.</strong> This separated server truth from client knowledge.</li>
+<li><strong>Extended the lock for uncertainty.</strong> A per-lock-holder ID makes an ambiguous acquisition distinguishable.</li>
+<li><strong>Finished Lab 2.</strong> The important result was not only passing tests, but understanding the protocol behind them.</li>
+</ol></div>
+
+<h2 id="mental">2. Core Distributed-Systems Mental Model</h2>
+<p>For every distributed-systems problem, ask:</p>
+<ol><li>What state exists?</li><li>Who owns it?</li><li>Who can modify it?</li><li>What happens concurrently?</li><li>What if a machine crashes?</li><li>What if a request is lost?</li><li>What if a reply is lost?</li><li>What if messages are delayed or reordered?</li><li>What does each participant know?</li><li>What guarantee does the client observe?</li></ol>
+<div class="card good"><strong>Key habit:</strong> Do not ask only “what happened?” Ask “what can this client <em>know</em> from the messages it received?” This became especially important with <code>ErrMaybe</code>.</div>
+
+<h2 id="kv">3. Key/Value Server</h2>
+<p>The KV service stores shared state indexed by a key. Conceptually:</p>
+<pre class="diagram">Client A ───── RPC ─────→ KV Server
+Client B ───── RPC ─────→ KV Server
+
+KV server state:
+
+"foo" → (value, version)
+"bar" → (value, version)</pre>
+<p>A <code>Get</code> reads state. A conditional <code>Put</code> attempts to change state only if the client's expected version still matches the server's current version.</p>
+
+<h3>Server-side mutex</h3>
+<p>A mutex around the server's map protects local memory from concurrent RPC handlers. It is a <strong>Go concurrency mechanism</strong>, not a distributed coordination protocol.</p>
+<div class="card warn"><strong>Important distinction:</strong> “The server is thread-safe” does not mean “the distributed system is coordinated.” The server mutex can serialize individual RPC handlers while a client's multi-RPC protocol remains racy.</div>
+
+<h2 id="mutex">4. Local Mutex vs Distributed Lock</h2>
+<table><tr><th>Local mutex</th><th>Distributed lock</th></tr>
+<tr><td>Coordinates goroutines in one process.</td><td>Coordinates independent clients/processes.</td></tr>
+<tr><td>Participants share the same mutex object.</td><td>Participants have separate local Lock objects but refer to shared distributed state.</td></tr>
+<tr><td>Memory is the coordination medium.</td><td>RPC + shared KV state are the coordination medium.</td></tr></table>
+<pre class="diagram">Process A                         Process B
+
+Lock object A                    Lock object B
+     │                                 │
+     └──────── shared KV state ────────┘
+                     │
+              logical lock "foo"</pre>
+
+<h2 id="version">5. Versions and Conditional Put</h2>
+<p>A version is best understood as a <strong>stale-state detector / state-change number</strong>. It is not the lock owner.</p>
+<pre>Get("foo") → value = "FREE", version = 7
+
+Put("foo", "A123", expectedVersion = 7)</pre>
+<p>The server conceptually does:</p>
+<pre>if currentVersion != expectedVersion:
+    return ErrVersion
+
+change value
+increment version
+return OK</pre>
+<p>This is similar to compare-and-swap: <strong>“change the state only if it is still the state I observed.”</strong></p>
+
+<table><tr><th>Version is</th><th>Version is not</th></tr>
+<tr><td>A change number tied to the key's state.</td><td>The owner identity.</td></tr>
+<tr><td>A way to reject stale updates.</td><td>FREE/HELD state itself.</td></tr>
+<tr><td>Something obtained from the server.</td><td>A permanent local truth after the state may have changed.</td></tr></table>
+
+<h2 id="race">6. The Get → Decide → Put Race</h2>
+<p>The central reliable-lock race:</p>
+<pre class="diagram">Initial:
+foo → FREE, version 10
+
+Client A                         Client B
+   │                                │
+   │ Get → FREE, v10               │
+   │                                │ Get → FREE, v10
+   │                                │
+   │ Put(A123, expected=10)        │
+   │ ───────────────→ OK           │
+   │                                │
+   │                                │ Put(B456, expected=10)
+   │                                │ ─────────────→ ErrVersion</pre>
+<p>Only one client can transition version 10. The server's conditional update provides the atomic point at which the competition is resolved.</p>
+
+<div class="card"><strong>Important lesson:</strong> Individual RPCs can be serialized by the server while the <em>protocol spanning multiple RPCs</em> is still concurrent. Atomicity must exist at the operation that decides ownership.</div>
+
+<h2 id="network">7. Unreliable Network</h2>
+<p>In the unreliable exercise, requests and replies may be dropped, delayed, or reordered. The client retries an RPC when it does not receive a reply.</p>
+<pre class="diagram">Client                         Network                         Server
+
+Put ───────────────────────────X
+                         request dropped
+
+Put ─────────────────────────────────────────────────────→ executes
+                                    ←──────────────X
+                                      reply dropped</pre>
+<p>From the client's perspective, both situations can initially look like “no reply.”</p>
+
+<h3>Why Get is easy to retry</h3>
+<p>Get does not mutate state. Repeating it does not create a second state transition.</p>
+<h3>Why Put is different</h3>
+<p>Put mutates state. The original request may already have succeeded even though the client never saw the reply.</p>
+
+<h2 id="maybe">8. ErrMaybe: The Client Does Not Know</h2>
+<p>Suppose the client sends a Put with expected version 7 and its reply disappears.</p>
+<pre class="diagram">Case A — original Put executed
+
+Client → Put(v7) → Server executes → version 8
+                       ↓
+                    reply lost
+
+Client retries Put(v7) → ErrVersion
+
+Case B — original Put never executed
+
+Client → Put(v7) → request lost
+
+Another client changes the key
+
+Client retries Put(v7) → ErrVersion</pre>
+<p>The same retry result is compatible with two different histories. Therefore the client cannot honestly return a definite success or definite failure.</p>
+<div class="card good"><strong>ErrMaybe means:</strong> “I do not know whether my original Put took effect.” It represents uncertainty in the client's knowledge, not uncertainty in the server's state.</div>
+
+<table><tr><th>Situation</th><th>What client can know</th></tr>
+<tr><td>Initial Put returns ErrVersion</td><td>The conditional update did not succeed against the observed version.</td></tr>
+<tr><td>Request/reply outcome is uncertain</td><td>The client may not know whether the operation happened.</td></tr>
+<tr><td>Retry produces ErrVersion after an ambiguous first attempt</td><td>Still ambiguous; the first request may already have succeeded.</td></tr></table>
+
+<h2 id="lock">9. Distributed Lock Built on KV</h2>
+<p>The lock is not a new server. It is a <strong>protocol implemented on top of the KV service</strong>.</p>
+<pre class="diagram">Logical lock name: "foo"
+
+KV:
+foo → FREE
+   or
+foo → owner-ID</pre>
+<p>Independent lock names are independent pieces of state:</p>
+<pre>foo → A123
+bar → FREE
+baz → B456</pre>
+
+<h3>Reliable-network algorithm</h3>
+<ol><li>Read the current lock state.</li><li>If free, conditionally change it to the caller's held state.</li><li>If another client changed it first, retry.</li><li>If held by someone else, wait/retry.</li><li>Release only when the current ownership is appropriate.</li></ol>
+
+<h2 id="ownership">10. Lock Name vs Owner ID</h2>
+<p>This was one of the most important conceptual corrections during the discussion.</p>
+<table><tr><th>Identifier</th><th>Meaning</th></tr>
+<tr><td><code>lockname</code></td><td>The logical shared resource, e.g. <code>"foo"</code>.</td></tr>
+<tr><td>owner/Lock ID</td><td>The particular Lock object / holder that claims the resource, e.g. <code>"A123"</code>.</td></tr></table>
+<pre class="diagram">                 same distributed lock
+KV key: "foo"
+        │
+        ├── Client A's Lock object → id A123
+        │
+        └── Client B's Lock object → id B456</pre>
+<p><code>MakeLock("foo")</code> creates a <strong>local handle</strong> to the logical lock. It does not create a new distributed lock.</p>
+
+<h3>Why lockname cannot also be the owner ID</h3>
+<pre class="diagram">lockname = "foo"
+
+A stores: "foo"
+B stores: "foo"
+
+A's acquisition reply is lost.
+A reads "foo".
+
+A cannot tell whether A or B owns the lock.</pre>
+<p>The holder identity must therefore be distinguishable from the logical resource name.</p>
+
+<h2 id="acquire">11. Acquire Under Unreliable Communication</h2>
+<p>The central protocol after an ambiguous Put is:</p>
+<pre class="diagram">Acquire
+  │
+  ├─ Get current state
+  │
+  └─ if free → conditional Put(myID)
+                    │
+          ┌─────────┼─────────────┐
+          │         │             │
+          OK    ErrVersion     ErrMaybe
+          │         │             │
+       acquired   retry        Get again
+                                      │
+                              ┌───────┴───────┐
+                              │               │
+                          value=myID      value≠myID
+                              │               │
+                           acquired       retry/wait</pre>
+<p>If <code>ErrMaybe</code> occurs and a subsequent Get shows the caller's ID, the caller can conclude that its acquisition took effect. If another ID or FREE is observed, it did not acquire the lock and should continue the protocol.</p>
+
+<div class="card good"><strong>Key insight:</strong> The owner ID does not make the network reliable. It makes an ambiguous outcome <em>observable from later state</em>.</div>
+
+<h2 id="release">12. Release and Ownership</h2>
+<p>A safe release should not mean “if the key is HELD, make it FREE.” It should be tied to the current owner.</p>
+<pre class="diagram">foo → A123
+
+A calls Release
+
+Get(foo) → A123
+
+conditional Put(foo, FREE, observedVersion)
+
+foo → FREE</pre>
+<p>If the stored value is <code>B456</code>, A should not release it. Otherwise one client could destroy another client's ownership.</p>
+
+<h3>Subtlety about ambiguous Release</h3>
+<p>A lost Release reply can also leave the caller uncertain. The general rule remains: a missing reply does not prove that the mutation failed. Later reads can provide evidence about the current state.</p>
+
+<h2 id="examples">13. Worked Failure Timelines</h2>
+<h3>A. Two clients race for a free lock</h3>
+<pre class="diagram">Initial: foo = FREE, v10
+
+A: Get → FREE, v10
+B: Get → FREE, v10
+
+A: Put(A123, v10) → OK
+   foo = A123, v11
+
+B: Put(B456, v10) → ErrVersion
+
+Result: A owns foo; B retries.</pre>
+
+<h3>B. A's acquisition succeeds but the reply is lost</h3>
+<pre class="diagram">A → Put(foo, A123, v10)
+Server executes → foo=A123, v11
+Reply is lost
+A observes ErrMaybe
+
+A → Get(foo)
+Server → A123, v11
+
+A123 == A's ID
+→ A knows it owns the lock.</pre>
+
+<h3>C. A's request is lost; B acquires</h3>
+<pre class="diagram">A → Put(foo, A123, v10)
+Request is lost
+
+B → Put(foo, B456, v10)
+Server executes → foo=B456
+
+A observes ErrMaybe
+A → Get(foo) → B456
+
+A123 != B456
+→ A did not acquire the lock.</pre>
+
+<h3>D. Why unconditional Put fails</h3>
+<pre class="diagram">Initial: FREE
+
+A: Get → FREE
+B: Get → FREE
+A: Put → HELD
+B: Put → HELD
+
+Both clients may believe they acquired it.</pre>
+
+<h2 id="findings">14. Findings and Learning Breakthroughs</h2>
+<ol>
+<li><strong>Distributed coordination is not local synchronization.</strong> A Go mutex solves a local memory problem; it does not coordinate separate clients.</li>
+<li><strong>Atomicity must cover the ownership decision.</strong> Serializing individual RPC handlers is insufficient when the decision spans Get and Put.</li>
+<li><strong>Conditional Put is the decisive race-resolution mechanism.</strong> It turns a stale observation into a rejected update rather than allowing both clients to win.</li>
+<li><strong>A version is a freshness check.</strong> It says “this update is based on the state I observed,” not “I own this resource.”</li>
+<li><strong>Retries do not make mutations automatically safe.</strong> Retrying a read is straightforward; retrying a mutation may duplicate or obscure the outcome.</li>
+<li><strong>ErrMaybe is about knowledge.</strong> The server has a definite history; the client may not know which history occurred.</li>
+<li><strong>Ownership identity resolves uncertainty.</strong> If the current lock value contains the holder ID, a later Get can reveal whether the ambiguous acquisition belongs to this client.</li>
+<li><strong>Lock name and holder identity are different dimensions.</strong> The name identifies the resource; the ID identifies the current claimant.</li>
+<li><strong>The distributed lock is a protocol layered over KV.</strong> No new lock server is required for the lab.</li>
+<li><strong>Failure reasoning is more important than the happy path.</strong> The difficult cases are lost replies, stale versions, races, crashes, and ambiguous outcomes.</li>
+</ol>
+
+<h2 id="mistakes">15. Misconceptions That Were Corrected</h2>
+<table><tr><th>Initial intuition</th><th>Correction</th></tr>
+<tr><td>“A local mutex should make the lock safe.”</td><td>Only if all participants share the same mutex; distributed clients do not.</td></tr>
+<tr><td>“The server mutex means the lock operations are atomic.”</td><td>The mutex protects each server operation; it does not make a multi-RPC client protocol atomic.</td></tr>
+<tr><td>“Eventual consistency explains the Go map race.”</td><td>No. Eventual consistency concerns distributed replicas; the race detector issue was unsynchronized local memory access.</td></tr>
+<tr><td>“ErrVersion always means my Put failed.”</td><td>Not after an earlier request/reply outcome became ambiguous. The first request may already have succeeded.</td></tr>
+<tr><td>“The API has no owner ID, so ownership cannot be represented.”</td><td>The Lock object can generate and store a local identifier and encode it in the shared KV value.</td></tr>
+<tr><td>“The lock ID could just be the lock name.”</td><td>Then every claimant has the same value, so an ambiguous acquisition remains ambiguous.</td></tr>
+<tr><td>“MakeLock creates a new distributed lock.”</td><td>It creates a local handle for a logical lock identified by the shared name.</td></tr>
+</table>
+
+<h2 id="open">16. Open Questions for Future Review</h2>
+<p>These are intentionally left as study questions rather than immediately answered.</p>
+<div class="qa"><strong>1.</strong> If a client crashes while holding the lock, what happens to the lock under the Lab 2 design?</div>
+<div class="qa"><strong>2.</strong> Why does the lab accept the possibility of a permanently held lock, and what would a production system need to change?</div>
+<div class="qa"><strong>3.</strong> Is the owner ID required to be mathematically globally unique, or merely sufficiently unlikely to collide under the lab's assumptions?</div>
+<div class="qa"><strong>4.</strong> What happens if two Lock objects in the same process use the same logical lock name but have different IDs?</div>
+<div class="qa"><strong>5.</strong> Can Release be made fully robust against an ambiguous reply without introducing additional state or operations?</div>
+<div class="qa"><strong>6.</strong> What exactly would “exactly once” mean for Put, and why is it harder than simply retrying?</div>
+<div class="qa"><strong>7.</strong> Which guarantees come from the KV server, and which guarantees come from the lock protocol?</div>
+<div class="qa"><strong>8.</strong> How would the protocol change if the server itself were replicated rather than a single KV server?</div>
+<div class="qa"><strong>9.</strong> What happens if the lock value changes after a Get but before a conditional Release?</div>
+<div class="qa"><strong>10.</strong> What is the connection between the “conditional update” idea in Lab 2 and Raft's rejection of stale terms/log information?</div>
+
+<h2 id="bridge">17. Bridge from Lab 2 to Raft</h2>
+<p>Lab 2 is an excellent foundation for Raft because it teaches the difference between <strong>state</strong>, <strong>knowledge of state</strong>, and <strong>safe state transitions</strong>.</p>
+<table><tr><th>Lab 2 concept</th><th>Raft connection</th></tr>
+<tr><td>Version</td><td>Raft terms/log metadata help identify stale information and newer epochs.</td></tr>
+<tr><td>Conditional Put</td><td>Raft uses consistency checks and rules that reject stale log information.</td></tr>
+<tr><td>ErrMaybe</td><td>Raft also has delayed/lost RPCs where an old message may arrive after local state has changed.</td></tr>
+<tr><td>Distributed lock</td><td>Raft is a broader coordination/consensus protocol; its goal is agreement on an ordered log rather than ownership of one resource.</td></tr>
+<tr><td>Shared KV state</td><td>A replicated state machine uses an agreed sequence of commands to drive replicated application state.</td></tr></table>
+<div class="card"><strong>Important distinction:</strong> A distributed lock asks “who owns this resource?” Raft asks a much more general question: “what sequence of decisions should this group of servers agree has occurred?”</div>
+
+<h2 id="checklist">18. Final Review Checklist</h2>
+<ol>
+<li>Can I explain why a local mutex cannot implement a distributed lock?</li>
+<li>Can I explain the Get → Put race?</li>
+<li>Can I explain exactly what a version does?</li>
+<li>Can I explain why conditional Put lets only one concurrent claimant win?</li>
+<li>Can I explain why Get is safe to retry?</li>
+<li>Can I explain why Put can become ambiguous after a lost reply?</li>
+<li>Can I define ErrMaybe in one sentence?</li>
+<li>Can I distinguish server state from client knowledge about that state?</li>
+<li>Can I explain why FREE/HELD is insufficient for ambiguous acquisition?</li>
+<li>Can I explain why lockname and owner ID must be different?</li>
+<li>Can I trace the ErrMaybe → Get → compare-ID path?</li>
+<li>Can I explain why Release must respect ownership?</li>
+<li>Can I identify which parts are distributed-systems concepts and which are Go implementation mechanisms?</li>
+<li>Can I connect conditional state changes and stale information to the problems Raft will solve?</li>
+</ol>
+
+<div class="card good"><strong>One-sentence Lab 2 summary:</strong><br>
+A distributed lock can be built on a versioned KV service by using conditional updates to resolve concurrent acquisition, and an owner identity to resolve uncertainty caused by lost RPC replies.</div>
+
+<footer>
+<p><strong>Personal study reference.</strong> This document consolidates the concepts and reasoning developed during the Lab 2 learning discussions. It intentionally emphasizes understanding over implementation details and is not an official MIT lab solution.</p>
+</footer>
+</main>
+</body>
+</html>
