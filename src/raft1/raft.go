@@ -9,7 +9,7 @@ package raft
 
 import (
 	//	"bytes"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -167,19 +167,21 @@ func (rf *Raft) RequestVote(leaderArgs *RequestVoteArgs, reply *RequestVoteReply
 	if rf.CurrentTerm > leaderArgs.Term {
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+	} else if rf.CurrentTerm < leaderArgs.Term {
+		rf.PeersType = Follower
+		rf.CurrentTerm = leaderArgs.Term
+		rf.isVoted = true
+		rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+		reply.VoteGranted = true
+		reply.Term = rf.CurrentTerm
 	} else if rf.CurrentTerm == leaderArgs.Term && !rf.isVoted {
 		rf.isVoted = true
+		rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
 		reply.VoteGranted = true
-		reply.Term = rf.CurrentTerm
-	} else if rf.CurrentTerm < leaderArgs.Term {
-		rf.CurrentTerm = leaderArgs.Term
-		reply.VoteGranted = true
-		rf.isVoted = true
-		rf.PeersType = Follower
 		reply.Term = rf.CurrentTerm
 	} else {
-		reply.VoteGranted = false
 		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = false
 	}
 }
 
@@ -207,61 +209,64 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) ticker() {
 	for true {
 		rf.mu.Lock()
-		if time.Now().After(rf.ElectionTimout) && rf.PeersType == Candidate {
+		if time.Now().After(rf.ElectionTimout) && (rf.PeersType == Candidate || rf.PeersType == Follower) {
+			rf.PeersType = Candidate
 			rf.CurrentTerm += 1
-			rf.VoteCount += 1
+			rf.VoteCount = 1
 			rf.isVoted = true
 			rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
 
-			go requestsForVotes(rf.peers, rf)
+			go rf.requestsForVotes(rf.CurrentTerm, rf.VoteCount)
 		}
 		rf.mu.Unlock()
-		ms := 100 + rand.Intn(50)
+		ms := 100 + rand.IntN(50)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
-func requestsForVotes(peers []*labrpc.ClientEnd, rf *Raft) {
-	rf.mu.Lock()
-	currentTerm := rf.CurrentTerm
-	currentVoteCount := rf.VoteCount
-	rf.mu.Unlock()
-	for _, peer := range peers {
-		if peer == peers[rf.me] {
+func (rf *Raft) requestsForVotes(currentTerm, voteCount int) {
+	for _, peer := range rf.peers {
+		if peer == rf.peers[rf.me] {
 			continue
 		}
-		requestVoteReply := &RequestVoteReply{}
-		ok := peer.Call("Raft.RequestVote", &RequestVoteArgs{Term: currentTerm, CandidateId: rf.me}, &requestVoteReply)
-		if ok {
-			rf.mu.Lock()
-			if requestVoteReply.VoteGranted && requestVoteReply.Term == currentTerm {
-				currentVoteCount += 1
-				rf.VoteCount = currentVoteCount
-
-				if rf.VoteCount > len(peers)/2 {
-					rf.PeersType = Leader
-					go sendHealthChecksToPeers(peers, rf)
-					rf.mu.Unlock()
-					continue
+		go func(peer *labrpc.ClientEnd) {
+			requestVoteReply := &RequestVoteReply{}
+			ok := peer.Call("Raft.RequestVote", &RequestVoteArgs{Term: currentTerm, CandidateId: rf.me}, &requestVoteReply)
+			if ok {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if requestVoteReply.VoteGranted && requestVoteReply.Term == rf.CurrentTerm {
+					voteCount += 1
+					rf.VoteCount = voteCount
+					if rf.VoteCount > len(rf.peers)/2 {
+						rf.PeersType = Leader
+						go rf.sendHealthChecksToPeers(rf.CurrentTerm)
+					}
 				}
-				rf.mu.Unlock()
-			} else {
-				rf.mu.Unlock()
 			}
-		}
+		}(peer)
 	}
 }
 
-func sendHealthChecksToPeers(peers []*labrpc.ClientEnd, rf *Raft) {
-	rf.mu.Lock()
-	currentTerm := rf.CurrentTerm
-	rf.mu.Unlock()
-	for _, peer := range peers {
-		if peer == peers[rf.me] {
+func (rf *Raft) sendHealthChecksToPeers(currentTerm int) {
+	for _, peer := range rf.peers {
+		if peer == rf.peers[rf.me] {
 			continue
 		}
-		appendEntriesReply := &AppendEntriesReply{}
-		peer.Call("Raft.AppendEntries", &AppendEntriesArgs{Term: currentTerm, LeaderId: rf.me}, &appendEntriesReply)
+		go func(peer *labrpc.ClientEnd) {
+			appendEntriesReply := &AppendEntriesReply{}
+			ok := peer.Call("Raft.AppendEntries", &AppendEntriesArgs{Term: currentTerm, LeaderId: rf.me}, &appendEntriesReply)
+			if ok {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if appendEntriesReply.Term > rf.CurrentTerm {
+					rf.isVoted = false
+					rf.CurrentTerm = appendEntriesReply.Term
+					rf.PeersType = Follower
+					rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+				}
+			}
+		}(peer)
 	}
 }
 
@@ -269,12 +274,10 @@ func (rf *Raft) AmILeader(peers []*labrpc.ClientEnd) {
 	for {
 		rf.mu.Lock()
 		if rf.PeersType == Leader {
-			go sendHealthChecksToPeers(peers, rf)
-		} else if rf.PeersType == Follower && time.Now().After(rf.ElectionTimout) {
-			rf.PeersType = Candidate
+			go rf.sendHealthChecksToPeers(rf.CurrentTerm)
 		}
 		rf.mu.Unlock()
-		ms := 100 + rand.Intn(50)
+		ms := 100 + rand.IntN(50)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -306,5 +309,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 func getRandomElectionTimeout() time.Duration {
-	return time.Duration(350+rand.Intn(151)) * time.Millisecond
+	return time.Duration(350+rand.IntN(151)) * time.Millisecond
 }
