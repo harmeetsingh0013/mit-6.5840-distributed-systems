@@ -9,6 +9,7 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -28,6 +29,11 @@ const (
 	Candidate PeerType = "candidate"
 )
 
+type LogRecord struct {
+	Term    int
+	Command interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu             sync.Mutex          // Lock to protect shared access to this peer's state
@@ -35,7 +41,7 @@ type Raft struct {
 	persister      *tester.Persister   // Object to hold this peer's persisted state
 	me             int                 // this peer's index into peers[]
 	CurrentTerm    int
-	Log            []string
+	Log            []LogRecord
 	ElectionTimout time.Time
 	PeersType      PeerType
 	VoteCount      int
@@ -113,6 +119,8 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
+	Entries      []LogRecord
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -185,6 +193,21 @@ func (rf *Raft) RequestVote(leaderArgs *RequestVoteArgs, reply *RequestVoteReply
 	}
 }
 
+func (rf *Raft) AppendEntriesV2(leaderArgs *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.CurrentTerm > leaderArgs.Term {
+		reply.Success = false
+		reply.Term = rf.CurrentTerm
+		return
+	} else {
+		rf.Log = append(rf.Log, leaderArgs.Entries...)
+		fmt.Println("Append V2 called .... ", rf.Log)
+		reply.Success = true
+		reply.Term = rf.CurrentTerm
+	}
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -197,11 +220,51 @@ func (rf *Raft) RequestVote(leaderArgs *RequestVoteArgs, reply *RequestVoteReply
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	index := len(rf.Log)
+	term := rf.CurrentTerm
+	isLeader := rf.PeersType == Leader
+	leaderId := rf.me
+	prevLogIndex := index - 1
+	prevLogTerm := rf.Log[prevLogIndex].Term
 
-	// Your code here (3B).
+	logRecord := LogRecord{Term: rf.CurrentTerm, Command: command}
+	rf.Log = append(rf.Log, logRecord)
+
+	rf.mu.Unlock()
+
+	if !isLeader {
+		return index, term, isLeader
+	}
+
+	for _, peer := range rf.peers {
+		if peer == rf.peers[rf.me] {
+			continue
+		}
+		go func(peer *labrpc.ClientEnd) {
+			appendEntriesReply := &AppendEntriesReply{}
+			appendEntriesArgs := &AppendEntriesArgs{
+				Term:         term,
+				LeaderId:     leaderId,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      []LogRecord{logRecord},
+			}
+
+			ok := peer.Call("Raft.AppendEntriesV2", &appendEntriesArgs, &appendEntriesReply)
+			if ok {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if appendEntriesReply.Term > rf.CurrentTerm {
+					rf.isVoted = false
+					rf.CurrentTerm = appendEntriesReply.Term
+					rf.PeersType = Follower
+					rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+				}
+			}
+
+		}(peer)
+	}
 
 	return index, term, isLeader
 }
@@ -293,8 +356,9 @@ func (rf *Raft) AmILeader(peers []*labrpc.ClientEnd) {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
-	electionTimeout := time.Now()
-	rf := &Raft{ElectionTimout: electionTimeout, PeersType: Follower}
+
+	initialLogRecord := LogRecord{Term: 0, Command: "fake command"}
+	rf := &Raft{ElectionTimout: time.Now(), PeersType: Follower, Log: []LogRecord{initialLogRecord}}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
