@@ -9,7 +9,7 @@ package raft
 
 import (
 	//	"bytes"
-	"fmt"
+
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -36,16 +36,20 @@ type LogRecord struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu             sync.Mutex          // Lock to protect shared access to this peer's state
-	peers          []*labrpc.ClientEnd // RPC end points of all peers
-	persister      *tester.Persister   // Object to hold this peer's persisted state
-	me             int                 // this peer's index into peers[]
-	CurrentTerm    int
-	Log            []LogRecord
-	ElectionTimout time.Time
-	PeersType      PeerType
-	VoteCount      int
-	isVoted        bool
+	mu                  sync.Mutex          // Lock to protect shared access to this peer's state
+	peers               []*labrpc.ClientEnd // RPC end points of all peers
+	persister           *tester.Persister   // Object to hold this peer's persisted state
+	me                  int                 // this peer's index into peers[]
+	electionTimout      time.Time
+	peersType           PeerType
+	voteCount           int
+	isVoted             bool
+	logReplicationCount int
+	applyCh             chan raftapi.ApplyMsg
+
+	CurrentTerm int
+	Log         []LogRecord
+	CommitIndex int
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -57,7 +61,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.CurrentTerm, rf.PeersType == Leader
+	return rf.CurrentTerm, rf.peersType == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -138,16 +142,16 @@ func (rf *Raft) AppendEntries(leaderArgs *AppendEntriesArgs, reply *AppendEntrie
 	} else if rf.CurrentTerm == leaderArgs.Term {
 		reply.Term = rf.CurrentTerm
 		rf.CurrentTerm = leaderArgs.Term
-		rf.PeersType = Follower
+		rf.peersType = Follower
 		timeout := getRandomElectionTimeout()
-		rf.ElectionTimout = time.Now().Add(timeout)
+		rf.electionTimout = time.Now().Add(timeout)
 		reply.Success = true
 	} else {
 		rf.isVoted = false
 		rf.CurrentTerm = leaderArgs.Term
-		rf.PeersType = Follower
+		rf.peersType = Follower
 		timeout := getRandomElectionTimeout()
-		rf.ElectionTimout = time.Now().Add(timeout)
+		rf.electionTimout = time.Now().Add(timeout)
 		reply.Success = true
 	}
 }
@@ -176,15 +180,15 @@ func (rf *Raft) RequestVote(leaderArgs *RequestVoteArgs, reply *RequestVoteReply
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
 	} else if rf.CurrentTerm < leaderArgs.Term {
-		rf.PeersType = Follower
+		rf.peersType = Follower
 		rf.CurrentTerm = leaderArgs.Term
 		rf.isVoted = true
-		rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+		rf.electionTimout = time.Now().Add(getRandomElectionTimeout())
 		reply.VoteGranted = true
 		reply.Term = rf.CurrentTerm
 	} else if rf.CurrentTerm == leaderArgs.Term && !rf.isVoted {
 		rf.isVoted = true
-		rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+		rf.electionTimout = time.Now().Add(getRandomElectionTimeout())
 		reply.VoteGranted = true
 		reply.Term = rf.CurrentTerm
 	} else {
@@ -201,10 +205,65 @@ func (rf *Raft) AppendEntriesV2(leaderArgs *AppendEntriesArgs, reply *AppendEntr
 		reply.Term = rf.CurrentTerm
 		return
 	} else {
-		rf.Log = append(rf.Log, leaderArgs.Entries...)
-		fmt.Println("Append V2 called .... ", rf.Log)
-		reply.Success = true
-		reply.Term = rf.CurrentTerm
+		prevLogIndex := leaderArgs.PrevLogIndex
+		newIndex := prevLogIndex + 1
+		if len(rf.Log) < prevLogIndex {
+			timeout := getRandomElectionTimeout()
+			rf.electionTimout = time.Now().Add(timeout)
+			rf.CurrentTerm = leaderArgs.Term
+			rf.peersType = Follower
+			rf.CommitIndex = leaderArgs.LeaderCommit
+
+			reply.Term = leaderArgs.Term
+			reply.Success = false
+			return
+		}
+		if len(rf.Log) == newIndex {
+			if rf.Log[prevLogIndex].Term == leaderArgs.PrevLogTerm {
+				timeout := getRandomElectionTimeout()
+				rf.electionTimout = time.Now().Add(timeout)
+				rf.CurrentTerm = leaderArgs.Term
+				rf.peersType = Follower
+				rf.CommitIndex = leaderArgs.LeaderCommit
+
+				reply.Term = rf.CurrentTerm
+				reply.Success = true
+
+				if len(leaderArgs.Entries) != 0 {
+					rf.Log = append(rf.Log, leaderArgs.Entries...)
+				}
+				return
+			} else {
+				timeout := getRandomElectionTimeout()
+				rf.electionTimout = time.Now().Add(timeout)
+				rf.CurrentTerm = leaderArgs.Term
+				rf.peersType = Follower
+
+				reply.Term = leaderArgs.Term
+				reply.Success = false
+				return
+			}
+
+		} else {
+			if rf.Log[prevLogIndex].Term == leaderArgs.PrevLogTerm {
+				timeout := getRandomElectionTimeout()
+				rf.electionTimout = time.Now().Add(timeout)
+				rf.CurrentTerm = leaderArgs.Term
+				rf.peersType = Follower
+				rf.CommitIndex = leaderArgs.LeaderCommit
+
+				reply.Term = rf.CurrentTerm
+				reply.Success = true
+
+				if len(leaderArgs.Entries) != 0 {
+					rf.Log = append(rf.Log, leaderArgs.Entries...)
+				} else {
+					rf.Log = rf.Log[0:newIndex]
+				}
+				return
+			}
+
+		}
 	}
 }
 
@@ -223,13 +282,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	index := len(rf.Log)
 	term := rf.CurrentTerm
-	isLeader := rf.PeersType == Leader
+	isLeader := rf.peersType == Leader
 	leaderId := rf.me
 	prevLogIndex := index - 1
 	prevLogTerm := rf.Log[prevLogIndex].Term
 
 	logRecord := LogRecord{Term: rf.CurrentTerm, Command: command}
 	rf.Log = append(rf.Log, logRecord)
+	rf.logReplicationCount = 1
 
 	rf.mu.Unlock()
 
@@ -256,10 +316,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if appendEntriesReply.Term > rf.CurrentTerm {
+					rf.voteCount = 0
 					rf.isVoted = false
 					rf.CurrentTerm = appendEntriesReply.Term
-					rf.PeersType = Follower
-					rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+					rf.peersType = Follower
+					rf.electionTimout = time.Now().Add(getRandomElectionTimeout())
+				}
+				if appendEntriesReply.Success && appendEntriesReply.Term == rf.CurrentTerm {
+					rf.logReplicationCount += 1
+
+					if rf.logReplicationCount > len(rf.peers)/2 {
+						rf.CommitIndex += 1
+						rf.logReplicationCount = 0
+						go func() {
+							rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logRecord.Command, CommandIndex: len(rf.Log) - 1}
+						}()
+					}
 				}
 			}
 
@@ -272,14 +344,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) ticker() {
 	for true {
 		rf.mu.Lock()
-		if time.Now().After(rf.ElectionTimout) && (rf.PeersType == Candidate || rf.PeersType == Follower) {
-			rf.PeersType = Candidate
+		if time.Now().After(rf.electionTimout) && (rf.peersType == Candidate || rf.peersType == Follower) {
+			rf.peersType = Candidate
 			rf.CurrentTerm += 1
-			rf.VoteCount = 1
+			rf.voteCount = 1
 			rf.isVoted = true
-			rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+			rf.electionTimout = time.Now().Add(getRandomElectionTimeout())
 
-			go rf.requestsForVotes(rf.CurrentTerm, rf.VoteCount)
+			go rf.requestsForVotes(rf.CurrentTerm, rf.voteCount)
 		}
 		rf.mu.Unlock()
 		ms := 100 + rand.IntN(50)
@@ -300,9 +372,9 @@ func (rf *Raft) requestsForVotes(currentTerm, voteCount int) {
 				defer rf.mu.Unlock()
 				if requestVoteReply.VoteGranted && requestVoteReply.Term == rf.CurrentTerm {
 					voteCount += 1
-					rf.VoteCount = voteCount
-					if rf.VoteCount > len(rf.peers)/2 {
-						rf.PeersType = Leader
+					rf.voteCount = voteCount
+					if rf.voteCount > len(rf.peers)/2 {
+						rf.peersType = Leader
 						go rf.sendHealthChecksToPeers(rf.CurrentTerm)
 					}
 				}
@@ -325,8 +397,8 @@ func (rf *Raft) sendHealthChecksToPeers(currentTerm int) {
 				if appendEntriesReply.Term > rf.CurrentTerm {
 					rf.isVoted = false
 					rf.CurrentTerm = appendEntriesReply.Term
-					rf.PeersType = Follower
-					rf.ElectionTimout = time.Now().Add(getRandomElectionTimeout())
+					rf.peersType = Follower
+					rf.electionTimout = time.Now().Add(getRandomElectionTimeout())
 				}
 			}
 		}(peer)
@@ -336,7 +408,7 @@ func (rf *Raft) sendHealthChecksToPeers(currentTerm int) {
 func (rf *Raft) AmILeader(peers []*labrpc.ClientEnd) {
 	for {
 		rf.mu.Lock()
-		if rf.PeersType == Leader {
+		if rf.peersType == Leader {
 			go rf.sendHealthChecksToPeers(rf.CurrentTerm)
 		}
 		rf.mu.Unlock()
@@ -358,10 +430,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 
 	initialLogRecord := LogRecord{Term: 0, Command: "fake command"}
-	rf := &Raft{ElectionTimout: time.Now(), PeersType: Follower, Log: []LogRecord{initialLogRecord}}
+	rf := &Raft{electionTimout: time.Now(), peersType: Follower, Log: []LogRecord{initialLogRecord}}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
