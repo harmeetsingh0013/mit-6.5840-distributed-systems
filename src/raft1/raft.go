@@ -9,6 +9,7 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -35,11 +36,12 @@ type Raft struct {
 	persister      *tester.Persister   // Object to hold this peer's persisted state
 	me             int                 // this peer's index into peers[]
 	CurrentTerm    int
-	Log            []string
+	Log            []ClientCommand
 	ElectionTimout time.Time
 	PeersType      PeerType
 	VoteCount      int
 	isVoted        bool
+	CommitedIndex  int
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -113,6 +115,8 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
+	Entries      []ClientCommand
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -123,24 +127,67 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(leaderArgs *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	fmt.Println("Called AppendEntries : ", leaderArgs)
+
+	prevLogIndex := leaderArgs.PrevLogIndex
+	newIndex := prevLogIndex + 1
+
 	if rf.CurrentTerm > leaderArgs.Term {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
 		return
-	} else if rf.CurrentTerm == leaderArgs.Term {
+	} else if len(rf.Log) > 0 && len(rf.Log) < prevLogIndex {
+		reply.Success = false
 		reply.Term = rf.CurrentTerm
-		rf.CurrentTerm = leaderArgs.Term
-		rf.PeersType = Follower
-		timeout := getRandomElectionTimeout()
-		rf.ElectionTimout = time.Now().Add(timeout)
-		reply.Success = true
-	} else {
-		rf.isVoted = false
-		rf.CurrentTerm = leaderArgs.Term
-		rf.PeersType = Follower
-		timeout := getRandomElectionTimeout()
-		rf.ElectionTimout = time.Now().Add(timeout)
-		reply.Success = true
+		return
+	} else if rf.CurrentTerm <= leaderArgs.Term {
+		if rf.CurrentTerm < leaderArgs.Term {
+			rf.isVoted = false
+		}
+		clientCommand := rf.Log[prevLogIndex]
+		if clientCommand.CurrentTerm == leaderArgs.PrevLogTerm {
+			fmt.Println(rf.Log)
+			fmt.Println(len(rf.Log), " ==== ", newIndex)
+			if len(rf.Log) == newIndex {
+				reply.Term = leaderArgs.Term
+				reply.Success = true
+
+				cliendCommands := make([]ClientCommand, len(leaderArgs.Entries))
+				for _, cmd := range leaderArgs.Entries {
+					cliendCommands = append(cliendCommands, ClientCommand{CurrentTerm: leaderArgs.Term, Command: cmd})
+				}
+				timeout := getRandomElectionTimeout()
+				rf.CurrentTerm = leaderArgs.Term
+				rf.PeersType = Follower
+				rf.ElectionTimout = time.Now().Add(timeout)
+				rf.Log = append(rf.Log, cliendCommands...)
+			} else {
+				oldLogEntries := rf.Log[newIndex:]
+				for i, cmd := range oldLogEntries {
+					if leaderArgs.Entries[i].CurrentTerm != cmd.CurrentTerm {
+						rf.Log[newIndex] = leaderArgs.Entries[i]
+						newIndex++
+					}
+				}
+				reply.Term = leaderArgs.Term
+				reply.Success = true
+
+				cliendCommands := make([]ClientCommand, len(leaderArgs.Entries))
+				for _, cmd := range leaderArgs.Entries {
+					cliendCommands = append(cliendCommands, ClientCommand{CurrentTerm: leaderArgs.Term, Command: cmd})
+				}
+				timeout := getRandomElectionTimeout()
+				rf.CurrentTerm = leaderArgs.Term
+				rf.PeersType = Follower
+				rf.ElectionTimout = time.Now().Add(timeout)
+				rf.Log = append(rf.Log, cliendCommands...)
+			}
+
+		} else {
+			reply.Success = false
+			reply.Term = clientCommand.CurrentTerm
+			return
+		}
 	}
 }
 
@@ -183,6 +230,11 @@ func (rf *Raft) RequestVote(leaderArgs *RequestVoteArgs, reply *RequestVoteReply
 	}
 }
 
+type ClientCommand struct {
+	CurrentTerm int
+	Command     interface{}
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -195,15 +247,82 @@ func (rf *Raft) RequestVote(leaderArgs *RequestVoteArgs, reply *RequestVoteReply
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	fmt.Println("Start command is calling....")
+	rf.mu.Lock()
+	index := len(rf.Log)
+	currentTerm := rf.CurrentTerm
+	isLeader := rf.PeersType == Leader
+	previousLogIndex := index - 1
+	peers := rf.peers
 
-	// Your code here (3B).
+	if isLeader {
+		fmt.Println("Passed command: ", command)
+		rf.Log[index].Command = command
+		rf.Log[index].CurrentTerm = currentTerm
 
-	return index, term, isLeader
+		for {
+			if len(peers) <= 0 {
+				break
+			}
+
+			passedPeer, peers := sendAppendEntries(
+				previousLogIndex,
+				rf.me,
+				currentTerm,
+				rf.Log[previousLogIndex].CurrentTerm,
+				command,
+				rf.peers,
+			)
+			if len(passedPeer) > len(peers) {
+				return index, currentTerm, isLeader
+			} else {
+				passedPeer, peers = sendAppendEntries(
+					previousLogIndex,
+					rf.me,
+					currentTerm,
+					rf.Log[previousLogIndex].CurrentTerm,
+					command,
+					rf.peers,
+				)
+			}
+		}
+
+	}
+	rf.mu.Unlock()
+
+	return index, currentTerm, isLeader
 }
 
+func sendAppendEntries(previousLogIndex int, me int, currentTerm int,
+	previosLogTerm int, command interface{}, peers []*labrpc.ClientEnd) ([]*labrpc.ClientEnd, []*labrpc.ClientEnd) {
+
+	fmt.Println(previousLogIndex, me)
+
+	failedPeer := make([]*labrpc.ClientEnd, len(peers))
+	passedPeer := make([]*labrpc.ClientEnd, len(peers))
+	for _, peer := range peers {
+		if peer == peers[me] {
+			continue
+		}
+		entries := make([]ClientCommand, 5)
+		entries = append(entries, ClientCommand{CurrentTerm: currentTerm, Command: command})
+		appendEtriesRequest := &AppendEntriesArgs{
+			Term:         currentTerm,
+			LeaderId:     me,
+			PrevLogIndex: previousLogIndex,
+			PrevLogTerm:  previosLogTerm,
+			Entries:      entries,
+		}
+		appendEntriesReply := &AppendEntriesReply{}
+		ok := peer.Call("Raft.AppendEntries", appendEtriesRequest, &appendEntriesReply)
+		if ok {
+			passedPeer = append(passedPeer, peer)
+		} else {
+			failedPeer = append(failedPeer, peer)
+		}
+	}
+	return passedPeer, failedPeer
+}
 func (rf *Raft) ticker() {
 	for true {
 		rf.mu.Lock()
@@ -279,19 +398,15 @@ func (rf *Raft) AmILeader(peers []*labrpc.ClientEnd) {
 	}
 }
 
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	electionTimeout := time.Now()
-	rf := &Raft{ElectionTimout: electionTimeout, PeersType: Follower}
+
+	commands := make([]ClientCommand, 5)
+	initialClientCommand := ClientCommand{CurrentTerm: 0, Command: "fake command"}
+	commands = append(commands, initialClientCommand)
+
+	rf := &Raft{ElectionTimout: electionTimeout, PeersType: Follower, Log: commands}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
