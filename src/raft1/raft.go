@@ -46,6 +46,7 @@ type Raft struct {
 	isVoted             bool
 	logReplicationCount int
 	applyCh             chan raftapi.ApplyMsg
+	commited            bool
 
 	CurrentTerm int
 	Log         []LogRecord
@@ -197,6 +198,13 @@ func (rf *Raft) RequestVote(leaderArgs *RequestVoteArgs, reply *RequestVoteReply
 	}
 }
 
+func elementExists(mySlice []LogRecord, index int) bool {
+	if index >= 0 && index < len(mySlice) {
+		return true
+	}
+	return false
+}
+
 func (rf *Raft) AppendEntriesV2(leaderArgs *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -218,19 +226,24 @@ func (rf *Raft) AppendEntriesV2(leaderArgs *AppendEntriesArgs, reply *AppendEntr
 			reply.Success = false
 			return
 		}
-		if len(rf.Log) == newIndex {
+		if elementExists(rf.Log, prevLogIndex) {
 			if rf.Log[prevLogIndex].Term == leaderArgs.PrevLogTerm {
 				timeout := getRandomElectionTimeout()
 				rf.electionTimout = time.Now().Add(timeout)
 				rf.CurrentTerm = leaderArgs.Term
 				rf.peersType = Follower
-				rf.CommitIndex = leaderArgs.LeaderCommit
 
 				reply.Term = rf.CurrentTerm
 				reply.Success = true
 
 				if len(leaderArgs.Entries) != 0 {
 					rf.Log = append(rf.Log, leaderArgs.Entries...)
+				}
+				if rf.CommitIndex < leaderArgs.LeaderCommit {
+					rf.CommitIndex = leaderArgs.LeaderCommit
+					go func() {
+						rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: rf.Log[prevLogIndex].Command, CommandIndex: prevLogIndex}
+					}()
 				}
 				return
 			} else {
@@ -280,6 +293,7 @@ func (rf *Raft) AppendEntriesV2(leaderArgs *AppendEntriesArgs, reply *AppendEntr
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := len(rf.Log)
 	term := rf.CurrentTerm
 	isLeader := rf.peersType == Leader
@@ -287,15 +301,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	prevLogIndex := index - 1
 	prevLogTerm := rf.Log[prevLogIndex].Term
 
-	logRecord := LogRecord{Term: rf.CurrentTerm, Command: command}
-	rf.Log = append(rf.Log, logRecord)
-	rf.logReplicationCount = 1
-
-	rf.mu.Unlock()
-
 	if !isLeader {
 		return index, term, isLeader
 	}
+
+	logRecord := LogRecord{Term: rf.CurrentTerm, Command: command}
+	rf.Log = append(rf.Log, logRecord)
+	rf.logReplicationCount = 1
+	rf.commited = false
 
 	for _, peer := range rf.peers {
 		if peer == rf.peers[rf.me] {
@@ -324,12 +337,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				}
 				if appendEntriesReply.Success && appendEntriesReply.Term == rf.CurrentTerm {
 					rf.logReplicationCount += 1
-
-					if rf.logReplicationCount > len(rf.peers)/2 {
+					if rf.logReplicationCount > len(rf.peers)/2 && !rf.commited {
 						rf.CommitIndex += 1
 						rf.logReplicationCount = 0
+						rf.commited = true
+						appendEntriesArgs := &AppendEntriesArgs{
+							Term:         rf.CurrentTerm,
+							PrevLogTerm:  rf.CurrentTerm,
+							LeaderId:     rf.me,
+							PrevLogIndex: len(rf.Log) - 1,
+							LeaderCommit: rf.CommitIndex,
+						}
+						for _, peer := range rf.peers {
+							go peer.Call("Raft.AppendEntriesV2", &appendEntriesArgs, &AppendEntriesReply{})
+						}
 						go func() {
-							rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logRecord.Command, CommandIndex: len(rf.Log) - 1}
+							rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: command, CommandIndex: len(rf.Log) - 1}
 						}()
 					}
 				}
